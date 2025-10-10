@@ -1,10 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"io"
 	"net/http"
 	"strconv"
@@ -66,10 +66,16 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	// buffer body for reuse across forward/upstream
 	var body []byte
 	if r.Body != nil {
-		body, _ = io.ReadAll(r.Body)
+		var err error
+		body, err = io.ReadAll(r.Body)
 		r.Body.Close()
+		if err != nil {
+			s.log.Error().Err(err).Str("method", r.Method).Str("path", r.URL.Path).Msg("failed to read request body")
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	r.Body = io.NopCloser(strings.NewReader(string(body)))
 
 	_, bucketKey, route := s.rl.Plan(r.Method, r.URL.Path, token)
 	s.handleUpstream(w, r, bucketKey, token, body, route)
@@ -81,7 +87,11 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request, key, tok
 	release, plannedWait := s.rl.AcquireWithRoute(key, token, route, acquireStart)
 	if plannedWait > 0 {
 		s.log.Debug().Dur("wait", plannedWait).Str("key", key).Msg("rate limit wait")
-		time.Sleep(plannedWait)
+		if err := waitWithContext(r.Context(), plannedWait); err != nil {
+			release(false, nil)
+			s.log.Debug().Err(err).Str("bucketKey", key).Str("route", route).Msg("request canceled while waiting for rate limit")
+			return
+		}
 	}
 	waited := time.Since(acquireStart)
 	// perform upstream request
@@ -103,14 +113,14 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request, key, tok
 }
 
 func extractToken(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	if auth == "" {
 		return ""
 	}
-	if strings.HasPrefix(strings.ToLower(auth), "bot ") {
+	if len(auth) >= 4 && strings.EqualFold(auth[:4], "bot ") {
 		return strings.TrimSpace(auth[4:])
 	}
-	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+	if len(auth) >= 7 && strings.EqualFold(auth[:7], "bearer ") {
 		return strings.TrimSpace(auth[7:])
 	}
 	return auth
@@ -322,90 +332,16 @@ func formatDurationSeconds(d time.Duration) string {
 	return strconv.FormatFloat(d.Seconds(), 'f', 3, 64)
 }
 
-const dashboardTemplateHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{.Title}}</title>
-<style>
-:root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-body { margin: 0; min-height: 100vh; background: linear-gradient(180deg, #0b1220 0%, #020617 100%); color: #e2e8f0; }
-main { max-width: 960px; margin: 0 auto; padding: 48px 24px 64px; }
-h1 { font-size: 2.25rem; margin: 0 0 0.25rem; }
-h2 { font-size: 1.25rem; margin: 0 0 1rem; }
-p { margin: 0; }
-small { color: rgba(226, 232, 240, 0.7); }
-.grid { margin-top: 28px; display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
-.card { background: rgba(15, 23, 42, 0.75); border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 16px; padding: 20px; backdrop-filter: blur(18px); box-shadow: 0 18px 40px rgba(15, 23, 42, 0.35); }
-.metric { font-size: 2.4rem; font-weight: 600; margin: 12px 0 4px; letter-spacing: -0.02em; }
-.subtle { font-size: 0.95rem; color: rgba(226, 232, 240, 0.65); }
-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid rgba(148, 163, 184, 0.2); }
-th { font-weight: 600; font-size: 0.9rem; color: rgba(226, 232, 240, 0.85); text-transform: uppercase; letter-spacing: 0.08em; }
-td { font-size: 1rem; }
-.pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 0.85rem; font-weight: 600; }
-.pill--success { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
-.pill--muted { background: rgba(148, 163, 184, 0.2); color: #cbd5f5; }
-@media (prefers-color-scheme: light) {
-		body { min-height: 100vh; background: linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%); color: #0f172a; }
-	.card { background: rgba(255, 255, 255, 0.85); border-color: rgba(100, 116, 139, 0.25); box-shadow: 0 14px 30px rgba(15, 23, 42, 0.12); }
-	small { color: rgba(71, 85, 105, 0.75); }
-	.subtle { color: rgba(71, 85, 105, 0.75); }
-	th, td { border-bottom-color: rgba(100, 116, 139, 0.18); }
-	.pill--muted { color: #475569; }
+func waitWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
-a { color: #38bdf8; text-decoration: none; }
-a:hover { text-decoration: underline; }
-</style>
-</head>
-<body>
-<main>
-	<header>
-		<h1>{{.Title}}</h1>
-		<p class="subtle">Started {{.Started}} · Generated {{.Generated}}</p>
-	</header>
-
-	<section class="grid">
-		<div class="card">
-			<p class="subtle">Uptime</p>
-			<p class="metric">{{.Uptime}}</p>
-			<small>{{.UptimeSeconds}} seconds</small>
-		</div>
-		<div class="card">
-			<p class="subtle">Rate Limits Avoided</p>
-			<p class="metric">{{.RateLimitsAvoided}}</p>
-			<span class="pill pill--success">Avoidance {{.AvoidanceRate}}</span>
-		</div>
-		<div class="card">
-			<p class="subtle">Rate Limits Hit</p>
-			<p class="metric">{{.RateLimitsHit}}</p>
-			<span class="pill pill--muted">Hit {{.HitRate}}</span>
-		</div>
-	</section>
-
-	<section class="card" style="margin-top: 28px;">
-		<h2>Proxy State</h2>
-		<table>
-			<tbody>
-				<tr><th scope="row">Buckets</th><td>{{.Buckets}}</td></tr>
-				<tr><th scope="row">Global Limiters</th><td>{{.Globals}}</td></tr>
-				<tr><th scope="row">Learned Routes</th><td>{{.Routes}}</td></tr>
-				<tr><th scope="row">Invalid Events (10m)</th><td>{{.InvalidEvents}}</td></tr>
-				<tr><th scope="row">Route Cache</th><td>{{.RouteCacheStatus}}{{if .RouteCachePersisted}} · <small>{{.StatePath}}</small>{{end}}</td></tr>
-				<tr><th scope="row">Bot Overrides</th><td>{{.BotOverrides}}</td></tr>
-				<tr><th scope="row">Max Upstream Retries</th><td>{{.MaxUpstreamRetries}}</td></tr>
-				<tr><th scope="row">Retry Backoff</th><td>{{.RetryBase}} → {{.RetryMax}}</td></tr>
-				<tr><th scope="row">HTTP/2</th><td>{{.HTTP2Status}}</td></tr>
-			</tbody>
-		</table>
-	</section>
-
-	<footer style="margin-top: 32px;" class="subtle">
-		Powered by <a href="https://github.com/melonly/sirocco" target="_blank" rel="noopener">Sirocco</a>
-	</footer>
-</main>
-</body>
-</html>`
-
-var dashboardTemplate = template.Must(template.New("dashboard").Parse(dashboardTemplateHTML))
