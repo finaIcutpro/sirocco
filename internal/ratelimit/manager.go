@@ -30,7 +30,9 @@ type Manager struct {
 	invalid atomic.Uint64
 }
 
-const retryAfterBuffer = 50 * time.Millisecond
+const (
+	maxRetryAfter = 2 * time.Second
+)
 
 // Snapshot returns a summary of limiter state for diagnostics.
 type Snapshot struct {
@@ -278,6 +280,17 @@ func dur(sec float64) time.Duration {
 	return time.Duration(sec * float64(time.Second))
 }
 
+func clampRetryAfterDuration(sec float64) time.Duration {
+	if sec <= 0 {
+		return 0
+	}
+	wait := dur(sec)
+	if wait > maxRetryAfter {
+		return maxRetryAfter
+	}
+	return wait
+}
+
 // routeLimiter enforces per-route limits based on heuristics and header feedback.
 type routeLimiter struct {
 	mu         sync.Mutex
@@ -329,7 +342,8 @@ func (rl *routeLimiter) apply(meta releaseMeta) {
 
 	now := time.Now()
 	if meta.hasRetryAfter && meta.retryAfter > 0 {
-		until := now.Add(dur(meta.retryAfter) + retryAfterBuffer)
+		wait := clampRetryAfterDuration(meta.retryAfter)
+		until := now.Add(wait)
 		if until.After(rl.blockUntil) {
 			rl.blockUntil = until
 		}
@@ -399,7 +413,8 @@ func (gl *globalLimiter) applyRetry(meta releaseMeta) {
 	gl.mu.Lock()
 	defer gl.mu.Unlock()
 
-	until := time.Now().Add(dur(meta.retryAfter) + retryAfterBuffer)
+	wait := clampRetryAfterDuration(meta.retryAfter)
+	until := time.Now().Add(wait)
 	if until.After(gl.blockUntil) {
 		gl.blockUntil = until
 	}

@@ -77,7 +77,7 @@ func Load() *Config {
 		BindAddr:           getenv("BIND_IP", "0.0.0.0"),
 		Port:               getint("PORT", 8080),
 		DiscordBaseURL:     getenv("DISCORD_BASE_URL", "https://discord.com"),
-		DisableHTTP2:       getenv("DISABLE_HTTP_2", "true") == "true",
+		DisableHTTP2:       getenv("DISABLE_HTTP_2", "false") == "true",
 		ValidationEnabled:  getbool("VALIDATION_ENABLED", true),
 		StatePath:          getenv("STATE_PATH", defaultStatePath()),
 		RequestTimeout:     getdurms("REQUEST_TIMEOUT", 5000),

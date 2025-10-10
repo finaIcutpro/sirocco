@@ -28,36 +28,44 @@ type DiscordClient struct {
 	retryMax   time.Duration
 }
 
+const hardRetryBackoffLimit = 2 * time.Second
+
 func NewDiscordClient(cfg *config.Config, log zerolog.Logger) (*DiscordClient, error) {
 	bu, err := url.Parse(cfg.DiscordBaseURL)
 	if err != nil {
 		return nil, err
 	}
 
-	d := &net.Dialer{Timeout: cfg.DialTimeout}
+	d := &net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}
 	if cfg.OutboundIP != nil {
 		d.LocalAddr = &net.TCPAddr{IP: cfg.OutboundIP}
 	}
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           d.DialContext,
-		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(256)},
 		IdleConnTimeout:       cfg.IdleConnTimeout,
 		ForceAttemptHTTP2:     !cfg.DisableHTTP2,
-		MaxIdleConns:          512,
-		MaxIdleConnsPerHost:   512,
-		MaxConnsPerHost:       512,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   1024,
+		MaxConnsPerHost:       1024,
 		TLSHandshakeTimeout:   cfg.DialTimeout,
-		ExpectContinueTimeout: 500 * time.Millisecond,
+		ExpectContinueTimeout: 250 * time.Millisecond,
 		ResponseHeaderTimeout: cfg.RequestTimeout,
 	}
 	retryBase := cfg.RetryBaseDelay
 	if retryBase <= 0 {
-		retryBase = 200 * time.Millisecond
+		retryBase = 150 * time.Millisecond
 	}
 	retryMax := cfg.RetryMaxDelay
 	if retryMax <= retryBase {
 		retryMax = retryBase * 4
+	}
+	if retryMax > hardRetryBackoffLimit {
+		retryMax = hardRetryBackoffLimit
+	}
+	if retryBase > retryMax {
+		retryBase = retryMax
 	}
 	maxRetries := cfg.MaxUpstreamRetries
 	if maxRetries < 0 {
