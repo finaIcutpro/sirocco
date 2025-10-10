@@ -37,13 +37,13 @@ a single go binary that keeps discord rest buckets warm, retries the flaky edge 
 
 ## why not roll your own gateway?
 
-- you'd have to implement route normalization, warm-start heuristics, guard rails for 401/403 storms, multiple retries, jitter, and connection management yourself.
+- you'd have to implement route normalization, warm-start, guard rails for 401/403 storms, multiple retries, jitter, and connection management yourself.
 - sirocco already streams exact wait times back to the caller and ships json diagnostics, so your application code stays focused on discord logic.
 
 ## why sirocco over [nirn proxy](https://github.com/germanoeich/nirn-proxy)?
 
 - no gossip or cluster bootstrap—drop one binary and get persistent buckets + health endpoints instantly.
-- auto-heated buckets via heuristics *and* disk snapshots, so fresh deployments don't take the 429 tax.
+- auto-heated buckets via disk snapshots, so fresh deployments don't take the 429 tax.
 - built-in invalid request dampener and retry policy instead of wiring prometheus + custom backoff rules.
 - fewer moving parts: no extra listeners, fewer knobs, same structured output nirn expects you to assemble.
 
