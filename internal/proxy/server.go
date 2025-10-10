@@ -17,6 +17,7 @@ import (
 	"github.com/melonly/sirocco/internal/ratelimit"
 	"github.com/melonly/sirocco/internal/transport"
 	"github.com/melonly/sirocco/internal/util"
+	"github.com/melonly/sirocco/internal/validation"
 )
 
 type Server struct {
@@ -24,13 +25,14 @@ type Server struct {
 	log zerolog.Logger
 	rl  *ratelimit.Manager
 	dc  *transport.DiscordClient
+	val *validation.Validator
 
 	http    *http.Server
 	started time.Time
 }
 
-func NewServer(cfg *config.Config, log zerolog.Logger, rl *ratelimit.Manager, dc *transport.DiscordClient) *Server {
-	s := &Server{cfg: cfg, log: log, rl: rl, dc: dc, started: time.Now()}
+func NewServer(cfg *config.Config, log zerolog.Logger, rl *ratelimit.Manager, dc *transport.DiscordClient, val *validation.Validator) *Server {
+	s := &Server{cfg: cfg, log: log, rl: rl, dc: dc, val: val, started: time.Now()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
 	s.http = &http.Server{Addr: cfg.BindAddr + ":" + itoa(cfg.Port), Handler: mux}
@@ -72,6 +74,18 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			s.log.Error().Err(err).Str("method", r.Method).Str("path", r.URL.Path).Msg("failed to read request body")
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	if s.val != nil {
+		if verr := s.val.Validate(r.Context(), r, body); verr != nil {
+			s.log.Debug().Str("method", r.Method).Str("path", r.URL.Path).Str("reason", verr.Reason).Msg("blocked invalid request before upstream")
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Sirocco-Validation", "blocked")
+			w.WriteHeader(verr.Status)
+			_, _ = w.Write(verr.ResponsePayload())
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
@@ -141,20 +155,25 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	snap := s.rl.Snapshot()
 	meta := struct {
-		UptimeSeconds       float64 `json:"uptime_seconds"`
-		RouteCachePersisted bool    `json:"route_cache_persisted"`
-		StatePath           string  `json:"state_path,omitempty"`
-		Buckets             int     `json:"buckets"`
-		Globals             int     `json:"globals"`
-		Routes              int     `json:"routes"`
-		InvalidEvents       int     `json:"invalid_events"`
-		BotOverrides        int     `json:"bot_overrides"`
-		MaxUpstreamRetries  int     `json:"max_upstream_retries"`
-		RetryBaseMS         int     `json:"retry_base_ms"`
-		RetryMaxMS          int     `json:"retry_max_ms"`
-		HTTP2Enabled        bool    `json:"http2_enabled"`
-		RateLimitsAvoided   uint64  `json:"rate_limits_avoided"`
-		RateLimitsHit       uint64  `json:"rate_limits_hit"`
+		UptimeSeconds        float64                  `json:"uptime_seconds"`
+		RouteCachePersisted  bool                     `json:"route_cache_persisted"`
+		StatePath            string                   `json:"state_path,omitempty"`
+		Buckets              int                      `json:"buckets"`
+		Globals              int                      `json:"globals"`
+		Routes               int                      `json:"routes"`
+		InvalidEvents        int                      `json:"invalid_events"`
+		BotOverrides         int                      `json:"bot_overrides"`
+		MaxUpstreamRetries   int                      `json:"max_upstream_retries"`
+		RetryBaseMS          int                      `json:"retry_base_ms"`
+		RetryMaxMS           int                      `json:"retry_max_ms"`
+		HTTP2Enabled         bool                     `json:"http2_enabled"`
+		RateLimitsAvoided    uint64                   `json:"rate_limits_avoided"`
+		RateLimitsHit        uint64                   `json:"rate_limits_hit"`
+		ValidationEnabled    bool                     `json:"validation_enabled"`
+		ValidationRequests   uint64                   `json:"validation_requests"`
+		ValidationBlocked    uint64                   `json:"validation_blocked"`
+		ValidationBlockRate  float64                  `json:"validation_block_rate"`
+		ValidationTopReasons []validation.ReasonCount `json:"validation_top_reasons,omitempty"`
 	}{
 		UptimeSeconds:       time.Since(s.started).Seconds(),
 		RouteCachePersisted: s.cfg.StatePath != "",
@@ -170,6 +189,16 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		HTTP2Enabled:        !s.cfg.DisableHTTP2,
 		RateLimitsAvoided:   snap.RateLimitsAvoided,
 		RateLimitsHit:       snap.RateLimitsHit,
+	}
+	if s.val != nil {
+		stats := s.val.Stats(10)
+		meta.ValidationEnabled = true
+		meta.ValidationRequests = stats.TotalValidated
+		meta.ValidationBlocked = stats.TotalBlocked
+		meta.ValidationBlockRate = stats.BlockRate
+		if len(stats.Reasons) > 0 {
+			meta.ValidationTopReasons = stats.Reasons
+		}
 	}
 	if !meta.RouteCachePersisted {
 		meta.StatePath = ""
@@ -208,6 +237,16 @@ type dashboardView struct {
 	RetryBase           string
 	RetryMax            string
 	HTTP2Status         string
+	ValidationEnabled   bool
+	ValidationValidated uint64
+	ValidationBlocked   uint64
+	ValidationRate      string
+	ValidationReasons   []validationReasonView
+}
+
+type validationReasonView struct {
+	Reason string
+	Count  uint64
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -224,6 +263,26 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if totalLimits > 0 {
 		avoidanceRate = fmt.Sprintf("%.1f%%", (float64(snap.RateLimitsAvoided)/float64(totalLimits))*100)
 		hitRate = fmt.Sprintf("%.1f%%", (float64(snap.RateLimitsHit)/float64(totalLimits))*100)
+	}
+	validationEnabled := false
+	validationValidated := uint64(0)
+	validationBlocked := uint64(0)
+	validationRate := "n/a"
+	var validationReasons []validationReasonView
+	if s.val != nil {
+		stats := s.val.Stats(5)
+		validationEnabled = true
+		validationValidated = stats.TotalValidated
+		validationBlocked = stats.TotalBlocked
+		if stats.TotalValidated > 0 {
+			validationRate = fmt.Sprintf("%.1f%%", stats.BlockRate*100)
+		}
+		if len(stats.Reasons) > 0 {
+			validationReasons = make([]validationReasonView, 0, len(stats.Reasons))
+			for _, rc := range stats.Reasons {
+				validationReasons = append(validationReasons, validationReasonView{Reason: rc.Reason, Count: rc.Count})
+			}
+		}
 	}
 	view := dashboardView{
 		Title:               "Sirocco Proxy Dashboard",
@@ -247,6 +306,11 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		RetryBase:           s.cfg.RetryBaseDelay.String(),
 		RetryMax:            s.cfg.RetryMaxDelay.String(),
 		HTTP2Status:         ternaryString(!s.cfg.DisableHTTP2, "Enabled", "Disabled"),
+		ValidationEnabled:   validationEnabled,
+		ValidationValidated: validationValidated,
+		ValidationBlocked:   validationBlocked,
+		ValidationRate:      validationRate,
+		ValidationReasons:   validationReasons,
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

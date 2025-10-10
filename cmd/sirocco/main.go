@@ -12,6 +12,7 @@ import (
 	"github.com/melonly/sirocco/internal/proxy"
 	"github.com/melonly/sirocco/internal/ratelimit"
 	"github.com/melonly/sirocco/internal/transport"
+	"github.com/melonly/sirocco/internal/validation"
 )
 
 func main() {
@@ -28,8 +29,13 @@ func main() {
 	rl := ratelimit.NewManager(cfg, log)
 	defer rl.Close()
 
+	validator, err := validation.New(log)
+	if err != nil {
+		log.Fatal().Err(err).Msg("request validator init failed")
+	}
+
 	// proxy server
-	srv := proxy.NewServer(cfg, log, rl, dc)
+	srv := proxy.NewServer(cfg, log, rl, dc, validator)
 
 	go func() {
 		if err := srv.Start(); err != nil {

@@ -178,6 +178,16 @@
                 <p class="metric">{{.RateLimitsHit}}</p>
                 <span class="pill pill--muted">Hit {{.HitRate}}</span>
             </div>
+            <div class="card">
+                <p class="subtle">Invalid Requests Blocked</p>
+                <p class="metric">{{.ValidationBlocked}}</p>
+                {{if .ValidationEnabled}}
+                <span class="pill pill--success">Intercept {{.ValidationRate}}</span>
+                <small>{{.ValidationValidated}} validated</small>
+                {{else}}
+                <span class="pill pill--muted">Validation disabled</span>
+                {{end}}
+            </div>
         </section>
 
         <section class="card" style="margin-top: 28px;">
@@ -222,6 +232,38 @@
                     </tr>
                 </tbody>
             </table>
+        </section>
+
+        <section class="card" style="margin-top: 28px;">
+            <h2>Request Validation</h2>
+            {{if .ValidationEnabled}}
+            <table>
+                <tbody>
+                    <tr>
+                        <th scope="row">Requests Validated</th>
+                        <td>{{.ValidationValidated}}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Blocked Before Discord</th>
+                        <td>{{.ValidationBlocked}} · <small>Intercept {{.ValidationRate}}</small></td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Top Block Reasons</th>
+                        <td>
+                            {{if .ValidationReasons}}
+                                {{range .ValidationReasons}}
+                                    <div>{{.Reason}} · {{.Count}}</div>
+                                {{end}}
+                            {{else}}
+                                <div>--</div>
+                            {{end}}
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+            {{else}}
+            <p class="subtle">Request validation is currently unavailable.</p>
+            {{end}}
         </section>
 
         <footer style="margin-top: 32px;" class="subtle">
