@@ -198,6 +198,10 @@ func (v *Validator) blockFromRouterError(err error, method, path string) *Error 
 		status = http.StatusNotFound
 	}
 
+	if reason == "no_matching_operation_was_found" {
+		return nil
+	}
+
 	detail := fmt.Sprintf("no discord route for %s %s", method, path)
 	return v.block(reason, status, detail, []string{msg})
 }
