@@ -219,11 +219,11 @@ func (d *DiscordClient) nextBackoff(attempt int) time.Duration {
 	if wait > d.retryMax {
 		wait = d.retryMax
 	}
-	min := wait / 2
-	if min <= 0 {
-		min = wait
+	minBackoff := wait / 2
+	if minBackoff <= 0 {
+		minBackoff = wait
 	}
-	return util.JitterDuration(min, wait)
+	return util.JitterDuration(minBackoff, wait)
 }
 
 func waitContext(ctx context.Context, d time.Duration) error {

@@ -7,23 +7,23 @@ import (
 )
 
 // JitterDuration returns a random duration in [min, max).
-func JitterDuration(min, max time.Duration) time.Duration {
-	if max <= min {
-		if min < 0 {
+func JitterDuration(minDur, maxDur time.Duration) time.Duration {
+	if maxDur <= minDur {
+		if minDur < 0 {
 			return 0
 		}
-		return min
+		return minDur
 	}
-	span := max - min
+	span := maxDur - minDur
 	if span <= 0 {
-		if min < 0 {
+		if minDur < 0 {
 			return 0
 		}
-		return min
+		return minDur
 	}
 	n, err := rand.Int(rand.Reader, big.NewInt(int64(span)))
 	if err != nil {
-		return max
+		return maxDur
 	}
-	return min + time.Duration(n.Int64())
+	return minDur + time.Duration(n.Int64())
 }

@@ -406,9 +406,9 @@ func (b *bucket) precheckHeuristic(route string, now time.Time) time.Duration {
 		return b.reset.Sub(now)
 	}
 	if b.cap == 0 || b.window == 0 {
-		if cap, win, ok := Heuristic(route); ok {
-			b.cap = cap
-			b.window = dur(win)
+		if capacity, windowSec, ok := Heuristic(route); ok {
+			b.cap = capacity
+			b.window = dur(windowSec)
 		}
 	}
 	if b.cap <= 0 || b.window == 0 {
