@@ -697,6 +697,19 @@ func NormalizeRoute(method, path string) string {
 	return method + " " + strings.Join(parts, "/")
 }
 
+func isSnowflake(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	// basic length heuristic (snowflakes are usually >= 17 digits)
+	return len(s) >= 5
+}
+
 const routeStateVersion = 1
 
 var stateFlushInterval = time.Second
