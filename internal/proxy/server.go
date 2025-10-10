@@ -160,7 +160,6 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		StatePath            string                   `json:"state_path,omitempty"`
 		Buckets              int                      `json:"buckets"`
 		Globals              int                      `json:"globals"`
-		Routes               int                      `json:"routes"`
 		InvalidEvents        int                      `json:"invalid_events"`
 		BotOverrides         int                      `json:"bot_overrides"`
 		MaxUpstreamRetries   int                      `json:"max_upstream_retries"`
@@ -181,7 +180,6 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		StatePath:           s.cfg.StatePath,
 		Buckets:             snap.Buckets,
 		Globals:             snap.Globals,
-		Routes:              snap.Routes,
 		InvalidEvents:       snap.InvalidEvents,
 		BotOverrides:        len(s.cfg.GlobalOverride),
 		MaxUpstreamRetries:  s.cfg.MaxUpstreamRetries,
@@ -238,7 +236,6 @@ type dashboardView struct {
 	RequestsPerSecond   string
 	Buckets             int
 	Globals             int
-	Routes              int
 	InvalidEvents       int
 	RouteCacheStatus    string
 	RouteCachePersisted bool
@@ -312,7 +309,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		RequestsPerSecond:   rps,
 		Buckets:             snap.Buckets,
 		Globals:             snap.Globals,
-		Routes:              snap.Routes,
 		InvalidEvents:       snap.InvalidEvents,
 		RouteCacheStatus:    ternaryString(s.cfg.StatePath != "", "Persisted", "Disabled"),
 		RouteCachePersisted: s.cfg.StatePath != "",

@@ -3,17 +3,12 @@ package ratelimit
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"errors"
-	"io/fs"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/rs/zerolog"
 
 	"github.com/melonly/sirocco/internal/config"
@@ -31,28 +26,16 @@ type Manager struct {
 	// token -> global limiter
 	globals map[string]*global
 
-	// route normalization mapping to learned bucket IDs per token
-	// route = method + " " + normalized path (major ids preserved)
-	routes map[string]map[string]string // route -> token -> bucketID
-
 	guard   invalidGuard
 	avoided atomic.Uint64
 	hits    atomic.Uint64
 	total   atomic.Uint64
-
-	statePath      string
-	stateSignal    chan struct{}
-	stateStop      chan struct{}
-	stateDirty     atomic.Bool
-	stateCloseOnce sync.Once
-	stateWG        sync.WaitGroup
 }
 
-// Snapshot summarizes manager state for diagnostics.
+// Snapshot returns a summary of limiter state for diagnostics.
 type Snapshot struct {
 	Buckets           int    `json:"buckets"`
 	Globals           int    `json:"globals"`
-	Routes            int    `json:"routes"`
 	InvalidEvents     int    `json:"invalid_events"`
 	RateLimitsAvoided uint64 `json:"rate_limits_avoided"`
 	RateLimitsHit     uint64 `json:"rate_limits_hit"`
@@ -61,22 +44,11 @@ type Snapshot struct {
 
 func NewManager(cfg *config.Config, log zerolog.Logger) *Manager {
 	m := &Manager{
-		cfg:       cfg,
-		log:       log,
-		buckets:   make(map[string]*bucket),
-		globals:   make(map[string]*global),
-		routes:    make(map[string]map[string]string),
-		guard:     newInvalidGuard(),
-		statePath: cfg.StatePath,
-	}
-	if m.statePath != "" {
-		if err := m.loadState(); err != nil {
-			log.Warn().Err(err).Str("path", m.statePath).Msg("failed to load persisted route state")
-		}
-		m.stateSignal = make(chan struct{}, 1)
-		m.stateStop = make(chan struct{})
-		m.stateWG.Add(1)
-		go m.stateLoop()
+		cfg:     cfg,
+		log:     log,
+		buckets: make(map[string]*bucket),
+		globals: make(map[string]*global),
+		guard:   newInvalidGuard(),
 	}
 	return m
 }
@@ -84,29 +56,10 @@ func NewManager(cfg *config.Config, log zerolog.Logger) *Manager {
 // Plan returns the bucket key and normalized route pattern used for limiter coordination.
 func (m *Manager) Plan(method, path, token string) (bucketKey, route string) {
 	route = NormalizeRoute(method, path)
-	var bucketID string
-	tokenKey := tokenRouteKey(token)
-	m.mu.RLock()
-	if tm, ok := m.routes[route]; ok {
-		bucketID = tm[tokenKey]
-	}
-	m.mu.RUnlock()
 	if token == "" {
-		// unauthenticated or webhook
-		if bucketID != "" {
-			m.log.Debug().Str("route", route).Str("bucketID", bucketID).Msg("planning unauthenticated request with bucket")
-			return "b::" + bucketID, route
-		}
-		m.log.Debug().Str("route", route).Msg("planning unauthenticated request")
 		return "r::" + route, route
 	}
-	if bucketID != "" {
-		bk := "b:" + tokenKey + ":" + bucketID
-		m.log.Debug().Str("route", route).Str("token", util.MaskToken(token)).Str("bucketID", bucketID).Msg("planning request with learned bucket")
-		return bk, route
-	}
-	// default to token affinity for route-scoped buckets when no bucket has been learned yet
-	m.log.Debug().Str("route", route).Str("token", util.MaskToken(token)).Msg("planning request with token affinity")
+	tokenKey := tokenRouteKey(token)
 	return "r:" + tokenKey + ":" + route, route
 }
 
@@ -143,7 +96,6 @@ func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (re
 func (m *Manager) buildReleaseFunc(b *bucket, g *global, token, route string, leave func()) func(bool, map[string]string) {
 	return func(success bool, headers map[string]string) {
 		meta := parseReleaseMeta(headers)
-		m.learnBucketFromHeaders(token, route, meta)
 		m.updateLimiters(g, b, token, success, meta)
 		m.markInvalidRequests(route, meta)
 		leave()
@@ -179,33 +131,6 @@ func parseReleaseMeta(headers map[string]string) releaseMeta {
 	}
 }
 
-func (m *Manager) learnBucketFromHeaders(token, route string, meta releaseMeta) {
-	if route == "" || meta.bucketID == "" {
-		return
-	}
-	tokenKey := tokenRouteKey(token)
-	var dirty bool
-	m.mu.Lock()
-	tm := m.routes[route]
-	if tm == nil {
-		tm = make(map[string]string)
-		m.routes[route] = tm
-	}
-	if existing, ok := tm[tokenKey]; !ok || existing != meta.bucketID {
-		tm[tokenKey] = meta.bucketID
-		dirty = true
-	}
-	m.mu.Unlock()
-	if dirty {
-		m.persistRoutesAsync()
-	}
-	if token != "" {
-		m.log.Debug().Str("route", route).Str("token", util.MaskToken(token)).Str("bucketID", meta.bucketID).Msg("learned bucket ID")
-		return
-	}
-	m.log.Debug().Str("route", route).Str("bucketID", meta.bucketID).Msg("learned bucket ID for unauthenticated route")
-}
-
 func (m *Manager) updateLimiters(g *global, b *bucket, token string, success bool, meta releaseMeta) {
 	if meta.retryAfter > 0 || meta.status == 429 {
 		m.hits.Add(1)
@@ -238,7 +163,6 @@ func (m *Manager) Snapshot() Snapshot {
 	m.mu.RLock()
 	snap.Buckets = len(m.buckets)
 	snap.Globals = len(m.globals)
-	snap.Routes = len(m.routes)
 	m.mu.RUnlock()
 	snap.InvalidEvents = m.guard.count(time.Now())
 	snap.RateLimitsAvoided = m.avoided.Load()
@@ -644,15 +568,6 @@ func isSnowflake(s string) bool {
 	return len(s) >= 5
 }
 
-const routeStateVersion = 1
-
-var stateFlushInterval = time.Second
-
-type routeState struct {
-	Version int                          `json:"version"`
-	Routes  map[string]map[string]string `json:"routes"`
-}
-
 func tokenRouteKey(token string) string {
 	if token == "" {
 		return ""
@@ -661,129 +576,6 @@ func tokenRouteKey(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (m *Manager) loadState() error {
-	if m.statePath == "" {
-		return nil
-	}
-	data, err := os.ReadFile(m.statePath)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	var st routeState
-	if err := sonic.Unmarshal(data, &st); err != nil {
-		return err
-	}
-	if st.Routes == nil {
-		return nil
-	}
-	m.mu.Lock()
-	for route, mapping := range st.Routes {
-		cp := make(map[string]string, len(mapping))
-		for k, v := range mapping {
-			cp[k] = v
-		}
-		m.routes[route] = cp
-	}
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *Manager) persistRoutesAsync() {
-	if m.stateSignal == nil {
-		return
-	}
-	m.stateDirty.Store(true)
-	select {
-	case m.stateSignal <- struct{}{}:
-	default:
-	}
-}
-
-func (m *Manager) stateLoop() {
-	ticker := time.NewTicker(stateFlushInterval)
-	defer ticker.Stop()
-	defer m.stateWG.Done()
-	var lastFlush time.Time
-	for {
-		select {
-		case <-ticker.C:
-			if m.stateDirty.Load() {
-				if m.flushState() {
-					m.stateDirty.Store(false)
-					lastFlush = time.Now()
-					_ = lastFlush
-				}
-			}
-		case <-m.stateSignal:
-			if !m.stateDirty.Load() {
-				continue
-			}
-			if !lastFlush.IsZero() && time.Since(lastFlush) < stateFlushInterval {
-				continue
-			}
-			if m.flushState() {
-				m.stateDirty.Store(false)
-				lastFlush = time.Now()
-				_ = lastFlush
-			}
-		case <-m.stateStop:
-			if m.stateDirty.Load() {
-				if m.flushState() {
-					lastFlush = time.Now()
-					_ = lastFlush
-				}
-				m.stateDirty.Store(false)
-			}
-			return
-		}
-	}
-}
-
-func (m *Manager) flushState() bool {
-	if m.statePath == "" {
-		return true
-	}
-	snapshot := make(map[string]map[string]string)
-	m.mu.RLock()
-	for route, mapping := range m.routes {
-		cp := make(map[string]string, len(mapping))
-		for k, v := range mapping {
-			cp[k] = v
-		}
-		snapshot[route] = cp
-	}
-	m.mu.RUnlock()
-	st := routeState{Version: routeStateVersion, Routes: snapshot}
-	data, err := sonic.Marshal(st)
-	if err != nil {
-		m.log.Error().Err(err).Msg("failed to marshal route state")
-		return false
-	}
-	dir := filepath.Dir(m.statePath)
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			if !errors.Is(err, fs.ErrExist) {
-				m.log.Error().Err(err).Str("path", dir).Msg("failed to create state directory")
-				return false
-			}
-		}
-	}
-	if err := util.AtomicWriteFile(m.statePath, data, 0o600); err != nil {
-		m.log.Error().Err(err).Str("path", m.statePath).Msg("failed to persist route state")
-		return false
-	}
-	m.log.Debug().Str("path", m.statePath).Int("routes", len(snapshot)).Msg("persisted route state")
-	return true
-}
-
 func (m *Manager) Close() {
-	m.stateCloseOnce.Do(func() {
-		if m.stateStop != nil {
-			close(m.stateStop)
-			m.stateWG.Wait()
-		}
-	})
+	// No-op since state management was removed
 }
