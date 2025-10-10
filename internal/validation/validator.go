@@ -86,6 +86,7 @@ func New(log zerolog.Logger) (*Validator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load discord openapi: %w", err)
 	}
+	normalizeOpenAPISpec(doc)
 	if err := doc.Validate(ctx); err != nil {
 		return nil, fmt.Errorf("validate discord openapi: %w", err)
 	}
