@@ -15,21 +15,19 @@ import (
 	"github.com/melonly/sirocco/internal/util"
 )
 
-// Manager coordinates per-bucket and global limits
+// Manager coordinates global and route-scoped rate limits.
 type Manager struct {
 	cfg *config.Config
 	log zerolog.Logger
 
-	mu sync.RWMutex
-	// key -> bucket limiter
-	buckets map[string]*bucket
-	// token -> global limiter
-	globals map[string]*global
+	mu      sync.RWMutex
+	buckets map[string]*routeLimiter
+	globals map[string]*globalLimiter
 
-	guard   invalidGuard
 	avoided atomic.Uint64
 	hits    atomic.Uint64
 	total   atomic.Uint64
+	invalid atomic.Uint64
 }
 
 const retryAfterBuffer = 50 * time.Millisecond
@@ -45,14 +43,12 @@ type Snapshot struct {
 }
 
 func NewManager(cfg *config.Config, log zerolog.Logger) *Manager {
-	m := &Manager{
+	return &Manager{
 		cfg:     cfg,
 		log:     log,
-		buckets: make(map[string]*bucket),
-		globals: make(map[string]*global),
-		guard:   newInvalidGuard(),
+		buckets: make(map[string]*routeLimiter),
+		globals: make(map[string]*globalLimiter),
 	}
-	return m
 }
 
 // Plan returns the bucket key and normalized route pattern used for limiter coordination.
@@ -65,97 +61,89 @@ func (m *Manager) Plan(method, path, token string) (bucketKey, route string) {
 	return "r:" + tokenKey + ":" + route, route
 }
 
-// AcquireWithRoute is like Acquire but also knows the route for header learning on commit
-func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (release func(success bool, headers map[string]string), wait time.Duration) {
+// AcquireWithRoute returns a release function and the amount of time the caller should wait
+// before making the upstream request.
+func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (func(success bool, headers map[string]string), time.Duration) {
 	m.total.Add(1)
-	g := m.getGlobal(token)
-	b := m.getBucket(key)
-	gpace := g.pace(want)
-	gwait := g.when(want)
-	if gpace > gwait {
-		gwait = gpace
+
+	rl := m.getRouteLimiter(key, route)
+	gl := m.getGlobalLimiter(token)
+
+	wait := rl.reserve(want)
+	if gl != nil {
+		if gw := gl.reserve(want); gw > wait {
+			wait = gw
+		}
 	}
-	bwait := b.when(want)
-	if bwait > gwait {
-		gwait = bwait
-	}
-	gsoft := g.softDelay(want)
-	if gsoft > gwait {
-		gwait = gsoft
-	}
-	extra := m.guard.delay(want)
-	if extra > gwait {
-		gwait = extra
-	}
-	leave := b.enter()
-	if gwait > 0 {
+	if wait > 0 {
 		m.avoided.Add(1)
-		m.log.Debug().Dur("wait", gwait).Str("key", key).Str("token", util.MaskToken(token)).Str("route", route).Msg("rate limiting request")
+		m.log.Debug().Dur("wait", wait).Str("key", key).Str("token", util.MaskToken(token)).Str("route", route).Msg("rate limiting request")
 	}
-	return m.buildReleaseFunc(b, g, token, route, leave), gwait
-}
 
-func (m *Manager) buildReleaseFunc(b *bucket, g *global, token, route string, leave func()) func(bool, map[string]string) {
-	return func(success bool, headers map[string]string) {
+	release := func(success bool, headers map[string]string) {
 		meta := parseReleaseMeta(headers)
-		m.updateLimiters(g, b, token, success, meta)
-		m.markInvalidRequests(route, meta)
-		leave()
+		if meta.hasRetryAfter || meta.status == 429 {
+			m.hits.Add(1)
+		}
+		if meta.isGlobal && gl != nil {
+			gl.applyRetry(meta)
+		} else {
+			rl.apply(meta)
+		}
+		m.trackInvalid(route, meta)
 	}
+
+	return release, wait
 }
 
-type releaseMeta struct {
-	scope      string
-	bucketID   string
-	limit      int
-	remaining  int
-	resetAfter float64
-	retryAfter float64
-	status     int
-	isGlobal   bool
+func (m *Manager) getRouteLimiter(key, route string) *routeLimiter {
+	m.mu.RLock()
+	rl := m.buckets[key]
+	m.mu.RUnlock()
+	if rl != nil {
+		return rl
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rl = m.buckets[key]; rl != nil {
+		return rl
+	}
+	rl = newRouteLimiter(route)
+	m.buckets[key] = rl
+	return rl
 }
 
-func parseReleaseMeta(headers map[string]string) releaseMeta {
-	if headers == nil {
-		return releaseMeta{}
+func (m *Manager) getGlobalLimiter(token string) *globalLimiter {
+	if token == "" {
+		return nil
 	}
-	scope := strings.ToLower(headers["x-ratelimit-scope"])
-	globalHint := strings.ToLower(headers["x-ratelimit-global"]) == "true"
-	return releaseMeta{
-		scope:      scope,
-		bucketID:   headers["x-ratelimit-bucket"],
-		limit:      parseInt(headers["x-ratelimit-limit"]),
-		remaining:  parseInt(headers["x-ratelimit-remaining"]),
-		resetAfter: parseFloatSeconds(headers["x-ratelimit-reset-after"]),
-		retryAfter: parseFloatSeconds(headers["retry-after"]),
-		status:     parseInt(headers["x-sirocco-status"]),
-		isGlobal:   scope == "global" || globalHint,
+	m.mu.RLock()
+	gl := m.globals[token]
+	m.mu.RUnlock()
+	if gl != nil {
+		return gl
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if gl = m.globals[token]; gl != nil {
+		return gl
+	}
+	base := 45
+	if o, ok := m.cfg.GlobalOverride[token]; ok && o > 0 {
+		base = o
+	}
+	gl = &globalLimiter{rate: base}
+	m.globals[token] = gl
+	return gl
 }
 
-func (m *Manager) updateLimiters(g *global, b *bucket, token string, success bool, meta releaseMeta) {
-	if meta.retryAfter > 0 || meta.status == 429 {
-		m.hits.Add(1)
-	}
-	if meta.isGlobal {
-		g.commitGlobal(meta.retryAfter)
-		m.log.Debug().Str("token", util.MaskToken(token)).Float64("retryAfter", meta.retryAfter).Msg("global rate limit hit")
+func (m *Manager) trackInvalid(route string, meta releaseMeta) {
+	if meta.status == 401 || meta.status == 403 || (meta.status == 429 && meta.scope != "shared") {
+		m.invalid.Add(1)
 		return
 	}
-	b.commit(meta.limit, meta.remaining, meta.resetAfter, meta.retryAfter)
-	if success {
-		g.commitSuccess()
-	}
-}
-
-func (m *Manager) markInvalidRequests(route string, meta releaseMeta) {
-	if meta.status == 401 || meta.status == 403 || (meta.status == 429 && meta.scope != "shared") {
-		m.guard.mark(time.Now())
-		m.log.Debug().Int("status", meta.status).Str("scope", meta.scope).Msg("marked invalid request")
-	}
 	if meta.status == 404 && strings.HasPrefix(route, "POST /webhooks/:id/") {
-		m.guard.mark(time.Now())
-		m.log.Debug().Str("route", route).Msg("marked webhook 404")
+		m.invalid.Add(1)
 	}
 }
 
@@ -166,372 +154,66 @@ func (m *Manager) Snapshot() Snapshot {
 	snap.Buckets = len(m.buckets)
 	snap.Globals = len(m.globals)
 	m.mu.RUnlock()
-	snap.InvalidEvents = m.guard.count(time.Now())
+	snap.InvalidEvents = int(m.invalid.Load())
 	snap.RateLimitsAvoided = m.avoided.Load()
 	snap.RateLimitsHit = m.hits.Load()
 	snap.TotalRequests = m.total.Load()
 	return snap
 }
 
-// invalidGuard tracks recent invalid requests to avoid CF bans (10k/10min per IP)
-type invalidGuard struct {
-	mu        sync.Mutex
-	events    []time.Time
-	window    time.Duration
-	threshold int
+// releaseMeta captures the signal headers returned by Discord.
+type releaseMeta struct {
+	scope         string
+	bucketID      string
+	limit         int
+	remaining     int
+	resetAfter    float64
+	retryAfter    float64
+	status        int
+	isGlobal      bool
+	hasLimit      bool
+	hasRemaining  bool
+	hasResetAfter bool
+	hasRetryAfter bool
 }
 
-func newInvalidGuard() invalidGuard {
-	return invalidGuard{window: 10 * time.Minute, threshold: 10000}
+func parseReleaseMeta(headers map[string]string) releaseMeta {
+	if headers == nil {
+		return releaseMeta{}
+	}
+	scope := strings.ToLower(headers["x-ratelimit-scope"])
+	globalHint := strings.ToLower(headers["x-ratelimit-global"]) == "true"
+
+	meta := releaseMeta{
+		scope:    scope,
+		bucketID: headers["x-ratelimit-bucket"],
+		status:   parseInt(headers["x-sirocco-status"]),
+		isGlobal: scope == "global" || globalHint,
+	}
+
+	if limit, ok := parseIntOK(headers["x-ratelimit-limit"]); ok {
+		meta.limit = limit
+		meta.hasLimit = true
+	}
+	if remaining, ok := parseIntOK(headers["x-ratelimit-remaining"]); ok {
+		meta.remaining = remaining
+		meta.hasRemaining = true
+	}
+	if resetAfter, ok := parseFloatOK(headers["x-ratelimit-reset-after"]); ok {
+		meta.resetAfter = resetAfter
+		meta.hasResetAfter = true
+	}
+	if retryAfter, ok := parseFloatOK(headers["retry-after"]); ok {
+		meta.retryAfter = retryAfter
+		meta.hasRetryAfter = true
+	}
+
+	return meta
 }
 
-func (g *invalidGuard) mark(now time.Time) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.events = append(g.events, now)
-	g.compact(now)
-}
-
-func (g *invalidGuard) delay(now time.Time) time.Duration {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.compact(now)
-	n := len(g.events)
-	if n == 0 {
-		return 0
-	}
-	// start backing off at 85% of threshold, linearly up to 2s
-	near := int(float64(g.threshold) * 0.85)
-	if n <= near {
-		return 0
-	}
-	ratio := float64(n-near) / float64(g.threshold-near)
-	if ratio < 0 {
-		ratio = 0
-	}
-	if ratio > 1 {
-		ratio = 1
-	}
-	return time.Duration(ratio * float64(2*time.Second))
-}
-
-func (g *invalidGuard) compact(now time.Time) {
-	cutoff := now.Add(-g.window)
-	i := 0
-	for i < len(g.events) && g.events[i].Before(cutoff) {
-		i++
-	}
-	if i > 0 {
-		copy(g.events, g.events[i:])
-		g.events = g.events[:len(g.events)-i]
-	}
-}
-
-func (g *invalidGuard) count(now time.Time) int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.compact(now)
-	return len(g.events)
-}
-
-func (m *Manager) getBucket(key string) *bucket {
-	m.mu.RLock()
-	b := m.buckets[key]
-	m.mu.RUnlock()
-	if b != nil {
-		return b
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if bb := m.buckets[key]; bb != nil {
-		return bb
-	}
-	nb := &bucket{}
-	m.buckets[key] = nb
-	return nb
-}
-
-func (m *Manager) getGlobal(token string) *global {
-	m.mu.RLock()
-	g := m.globals[token]
-	m.mu.RUnlock()
-	if g != nil {
-		return g
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if gg := m.globals[token]; gg != nil {
-		return gg
-	}
-	base := 75 // ease default RPS to reduce premature throttling
-	if o, ok := m.cfg.GlobalOverride[token]; ok && o > 0 {
-		base = o
-	}
-	ng := &global{rps: base}
-	m.globals[token] = ng
-	return ng
-}
-
-// bucket models a per-route bucket with reset-after semantics
-type bucket struct {
-	mu        sync.Mutex
-	reset     time.Time
-	remaining int
-	cap       int
-	grace     int
-	q         []chan struct{}
-	confirmed bool
-}
-
-func (b *bucket) when(now time.Time) time.Duration {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if now.After(b.reset) {
-		if b.cap > 0 {
-			b.remaining = b.cap
-			if b.grace == 0 {
-				b.grace = 1
-			}
-		}
-		return 0
-	}
-	if b.remaining > 0 {
-		return 0
-	}
-	if b.grace > 0 && b.remaining > -b.grace {
-		return 0
-	}
-	if now.Before(b.reset) {
-		return b.reset.Sub(now)
-	}
-	return 0
-}
-
-func (b *bucket) commit(limit, remaining int, resetAfterSec, retryAfterSec float64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	now := time.Now()
-	hasSignal := limit > 0 || resetAfterSec > 0 || retryAfterSec > 0
-	targetGrace := 0
-	if limit > 0 {
-		b.cap = limit
-		// allow a small negative grace to absorb burst jitter without instant blocking
-		targetGrace = limit / 5
-		if targetGrace < 1 {
-			targetGrace = 1
-		}
-	}
-	if retryAfterSec > 0 {
-		b.reset = now.Add(dur(retryAfterSec) + retryAfterBuffer)
-		b.remaining = 0
-		// disable grace while honoring a hard retry-after to prevent immediate replays
-		b.grace = 0
-		if hasSignal {
-			b.confirmed = true
-		}
-		return
-	}
-	if resetAfterSec > 0 {
-		b.reset = now.Add(dur(resetAfterSec))
-		b.remaining = remaining
-		if b.remaining < 0 {
-			b.remaining = 0
-		}
-		if targetGrace > b.grace {
-			b.grace = targetGrace
-		}
-		if b.cap > 0 && b.remaining > b.cap {
-			b.remaining = b.cap
-		}
-		if hasSignal {
-			b.confirmed = true
-		}
-		return
-	}
-	if hasSignal {
-		b.confirmed = true
-	}
-}
-
-// enter enforces strict FIFO for requests within a bucket
-func (b *bucket) enter() (leave func()) {
-	ch := make(chan struct{})
-	b.mu.Lock()
-	wait := len(b.q) > 0
-	b.q = append(b.q, ch)
-	// if there was someone ahead, we'll wait on our chan; else we're first and proceed
-	b.mu.Unlock()
-	if wait {
-		<-ch
-	}
-	return func() {
-		b.mu.Lock()
-		if len(b.q) > 0 {
-			// pop self
-			b.q = b.q[1:]
-			if len(b.q) > 0 {
-				// signal next
-				close(b.q[0])
-			}
-		}
-		b.mu.Unlock()
-	}
-}
-
-// global simple token bucket style based on RPS
-type global struct {
-	mu       sync.Mutex
-	rps      int
-	window   time.Time
-	used     int
-	succ     int
-	lastTune time.Time
-	next     time.Time
-}
-
-func (g *global) when(now time.Time) time.Duration {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if now.After(g.window) {
-		g.window = now.Add(time.Second)
-		g.used = 0
-		if now.After(g.next) {
-			g.next = now
-		}
-	}
-	if g.used < g.rps {
-		return 0
-	}
-	return g.window.Sub(now)
-}
-
-// pace enforces a minimum spacing between requests based on the current RPS budget.
-func (g *global) pace(now time.Time) time.Duration {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.rps <= 0 {
-		return 0
-	}
-	spacing := time.Second / time.Duration(g.rps)
-	if spacing <= 0 {
-		spacing = time.Millisecond
-	}
-	if now.Before(g.next) {
-		wait := g.next.Sub(now)
-		g.next = g.next.Add(spacing)
-		return wait
-	}
-	g.next = now.Add(spacing)
-	return 0
-}
-
-// commitGlobal applies Discord global retry-after signals and tunes the limiter.
-func (g *global) commitGlobal(retryAfterSec float64) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	now := time.Now()
-	if retryAfterSec > 0 {
-		g.window = now.Add(dur(retryAfterSec) + retryAfterBuffer)
-		g.used = g.rps // block until window
-		g.next = g.window
-		// tune down softly
-		if g.rps > 1 {
-			dec := g.rps / 20
-			if dec < 1 {
-				dec = 1
-			}
-			g.rps -= dec
-			if g.rps < 1 {
-				g.rps = 1
-			}
-		}
-	} else if now.After(g.window) {
-		g.window = now.Add(time.Second)
-		g.used = 0
-		if now.After(g.next) {
-			g.next = now
-		}
-	}
-}
-
-func (g *global) commitSuccess() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.used++
-	g.succ++
-	now := time.Now()
-	if now.After(g.next) {
-		g.next = now
-	}
-	if now.Sub(g.lastTune) > time.Second && g.succ >= g.rps {
-		// gentle ramp up
-		g.rps++
-		g.succ = 0
-		g.lastTune = now
-	}
-}
-
-// softDelay nudges callers to back off before fully exhausting the global budget.
-func (g *global) softDelay(now time.Time) time.Duration {
-	g.mu.Lock()
-	window := g.window
-	used := g.used
-	rps := g.rps
-	g.mu.Unlock()
-	if rps <= 0 {
-		return 0
-	}
-	if now.After(window) || window.IsZero() {
-		return 0
-	}
-	remaining := rps - used
-	if remaining < 0 {
-		remaining = 0
-	}
-	threshold := rps / 5
-	if threshold < 1 {
-		threshold = 1
-	}
-	if remaining > threshold {
-		return 0
-	}
-	windowLeft := window.Sub(now)
-	if windowLeft <= 0 {
-		return 0
-	}
-	ratio := float64(threshold-remaining+1) / float64(threshold+1)
-	wait := time.Duration(ratio * float64(windowLeft) * 0.1)
-	if wait < time.Millisecond {
-		wait = time.Millisecond
-	}
-	maxWait := wait + windowLeft/time.Duration(threshold+1)
-	if maxWait <= wait {
-		maxWait = wait + time.Millisecond
-	}
-	return util.JitterDuration(wait, maxWait)
-}
-
-// Helpers
-func dur(sec float64) time.Duration { return time.Duration(sec * float64(time.Second)) }
-
-func parseInt(s string) int { n, _ := strconv.Atoi(s); return n }
-func parseFloatSeconds(s string) float64 {
-	if s == "" {
-		return 0
-	}
-	// can be integer or float seconds; if ms is provided elsewhere, it is typically retry-after header in seconds
-	f, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0
-	}
-	return f
-}
-
-// NormalizeRoute returns Discord-style route pattern preserving major parameters
+// NormalizeRoute returns Discord-style route pattern preserving major parameters.
 func NormalizeRoute(method, path string) string {
 	parts := strings.Split(path, "/")
-	// parts[0] is ""
-	// preserve next id after channels|guilds|webhooks
 	preserveNext := false
 	for i := 1; i < len(parts); i++ {
 		p := parts[i]
@@ -542,7 +224,6 @@ func NormalizeRoute(method, path string) string {
 		default:
 			if preserveNext {
 				preserveNext = false
-				// keep as-is
 			} else if isSnowflake(p) {
 				parts[i] = ":id"
 			}
@@ -560,18 +241,169 @@ func isSnowflake(s string) bool {
 			return false
 		}
 	}
-	// basic length heuristic (snowflakes are usually >= 17 digits)
 	return len(s) >= 5
 }
 
 func tokenRouteKey(token string) string {
-	if token == "" {
-		return ""
-	}
 	sum := sha1.Sum([]byte(token))
 	return hex.EncodeToString(sum[:])
 }
 
-func (m *Manager) Close() {
-	// No-op since state management was removed
+// Helpers
+func parseInt(s string) int { n, _ := strconv.Atoi(s); return n }
+
+func parseIntOK(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func parseFloatOK(s string) (float64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
+}
+
+func dur(sec float64) time.Duration {
+	return time.Duration(sec * float64(time.Second))
+}
+
+// routeLimiter enforces per-route limits based on heuristics and header feedback.
+type routeLimiter struct {
+	mu         sync.Mutex
+	cap        int
+	remaining  int
+	window     time.Duration
+	reset      time.Time
+	blockUntil time.Time
+}
+
+func newRouteLimiter(route string) *routeLimiter {
+	rl := &routeLimiter{}
+	if cap, windowSec, ok := Heuristic(route); ok {
+		rl.cap = cap
+		rl.remaining = cap
+		rl.window = dur(windowSec)
+	}
+	return rl
+}
+
+func (rl *routeLimiter) reserve(now time.Time) time.Duration {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	if now.Before(rl.blockUntil) {
+		return rl.blockUntil.Sub(now)
+	}
+	if rl.window > 0 && (rl.reset.IsZero() || now.After(rl.reset)) {
+		rl.reset = now.Add(rl.window)
+		rl.remaining = rl.cap
+	}
+	if rl.cap == 0 {
+		return 0
+	}
+	if rl.remaining > 0 {
+		rl.remaining--
+		return 0
+	}
+	wait := rl.reset.Sub(now)
+	if wait < 0 {
+		wait = 0
+	}
+	return wait
+}
+
+func (rl *routeLimiter) apply(meta releaseMeta) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	if meta.hasRetryAfter && meta.retryAfter > 0 {
+		until := now.Add(dur(meta.retryAfter) + retryAfterBuffer)
+		if until.After(rl.blockUntil) {
+			rl.blockUntil = until
+		}
+	}
+	if meta.hasLimit && meta.limit > 0 {
+		rl.cap = meta.limit
+		if !meta.hasRemaining {
+			rl.remaining = meta.limit
+		}
+	}
+	if meta.hasRemaining {
+		rl.remaining = meta.remaining
+		if rl.remaining < 0 {
+			rl.remaining = 0
+		}
+	}
+	if meta.hasResetAfter && meta.resetAfter > 0 {
+		rl.window = dur(meta.resetAfter)
+		rl.reset = now.Add(rl.window)
+	} else if rl.window == 0 && rl.cap > 0 {
+		rl.window = time.Second
+		rl.reset = now.Add(rl.window)
+	}
+	if rl.cap > 0 && rl.remaining > rl.cap {
+		rl.remaining = rl.cap
+	}
+}
+
+// globalLimiter enforces per-token global limits.
+type globalLimiter struct {
+	mu         sync.Mutex
+	rate       int
+	used       int
+	reset      time.Time
+	blockUntil time.Time
+}
+
+func (gl *globalLimiter) reserve(now time.Time) time.Duration {
+	gl.mu.Lock()
+	defer gl.mu.Unlock()
+
+	if now.Before(gl.blockUntil) {
+		return gl.blockUntil.Sub(now)
+	}
+	if now.After(gl.reset) {
+		gl.reset = now.Add(time.Second)
+		gl.used = 0
+	}
+	if gl.rate <= 0 {
+		return 0
+	}
+	if gl.used < gl.rate {
+		gl.used++
+		return 0
+	}
+	wait := gl.reset.Sub(now)
+	if wait < 0 {
+		wait = 0
+	}
+	return wait
+}
+
+func (gl *globalLimiter) applyRetry(meta releaseMeta) {
+	if !meta.hasRetryAfter || meta.retryAfter <= 0 {
+		return
+	}
+	gl.mu.Lock()
+	defer gl.mu.Unlock()
+
+	until := time.Now().Add(dur(meta.retryAfter) + retryAfterBuffer)
+	if until.After(gl.blockUntil) {
+		gl.blockUntil = until
+	}
+	if gl.rate > 1 {
+		gl.rate--
+	}
 }

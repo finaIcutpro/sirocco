@@ -27,7 +27,6 @@ func main() {
 
 	// rate limiter
 	rl := ratelimit.NewManager(cfg, log)
-	defer rl.Close()
 
 	var validator *validation.Validator
 	if cfg.ValidationEnabled {
