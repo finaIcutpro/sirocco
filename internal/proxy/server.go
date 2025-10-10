@@ -174,6 +174,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		ValidationBlocked    uint64                   `json:"validation_blocked"`
 		ValidationBlockRate  float64                  `json:"validation_block_rate"`
 		ValidationTopReasons []validation.ReasonCount `json:"validation_top_reasons,omitempty"`
+		TotalRequests        uint64                   `json:"total_requests"`
 	}{
 		UptimeSeconds:       time.Since(s.started).Seconds(),
 		RouteCachePersisted: s.cfg.StatePath != "",
@@ -200,6 +201,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 			meta.ValidationTopReasons = stats.Reasons
 		}
 	}
+	meta.TotalRequests = snap.TotalRequests
 	if !meta.RouteCachePersisted {
 		meta.StatePath = ""
 	}
@@ -233,6 +235,7 @@ type dashboardView struct {
 	RateLimitsHit       uint64
 	AvoidanceRate       string
 	HitRate             string
+	RequestsPerSecond   string
 	Buckets             int
 	Globals             int
 	Routes              int
@@ -272,6 +275,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		avoidanceRate = fmt.Sprintf("%.1f%%", (float64(snap.RateLimitsAvoided)/float64(totalLimits))*100)
 		hitRate = fmt.Sprintf("%.1f%%", (float64(snap.RateLimitsHit)/float64(totalLimits))*100)
 	}
+	rps := "n/a"
+	if uptime.Seconds() > 0 {
+		rps = fmt.Sprintf("%.1f", float64(snap.TotalRequests)/uptime.Seconds())
+	}
 	validationEnabled := false
 	validationValidated := uint64(0)
 	validationBlocked := uint64(0)
@@ -302,6 +309,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		RateLimitsHit:       snap.RateLimitsHit,
 		AvoidanceRate:       avoidanceRate,
 		HitRate:             hitRate,
+		RequestsPerSecond:   rps,
 		Buckets:             snap.Buckets,
 		Globals:             snap.Globals,
 		Routes:              snap.Routes,

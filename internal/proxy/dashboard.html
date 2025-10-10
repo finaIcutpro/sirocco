@@ -169,6 +169,11 @@
                 <small>{{.UptimeSeconds}} seconds</small>
             </div>
             <div class="card">
+                <p class="subtle">Requests per Second</p>
+                <p class="metric">{{.RequestsPerSecond}}</p>
+                <small>avg since start</small>
+            </div>
+            <div class="card">
                 <p class="subtle">Rate Limits Avoided</p>
                 <p class="metric">{{.RateLimitsAvoided}}</p>
                 <span class="pill pill--success">Avoidance {{.AvoidanceRate}}</span>

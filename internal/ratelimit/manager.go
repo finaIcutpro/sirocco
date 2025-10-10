@@ -38,6 +38,7 @@ type Manager struct {
 	guard   invalidGuard
 	avoided atomic.Uint64
 	hits    atomic.Uint64
+	total   atomic.Uint64
 
 	statePath      string
 	stateSignal    chan struct{}
@@ -55,6 +56,7 @@ type Snapshot struct {
 	InvalidEvents     int    `json:"invalid_events"`
 	RateLimitsAvoided uint64 `json:"rate_limits_avoided"`
 	RateLimitsHit     uint64 `json:"rate_limits_hit"`
+	TotalRequests     uint64 `json:"total_requests"`
 }
 
 func NewManager(cfg *config.Config, log zerolog.Logger) *Manager {
@@ -110,6 +112,7 @@ func (m *Manager) Plan(method, path, token string) (bucketKey, route string) {
 
 // AcquireWithRoute is like Acquire but also knows the route for header learning on commit
 func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (release func(success bool, headers map[string]string), wait time.Duration) {
+	m.total.Add(1)
 	g := m.getGlobal(token)
 	b := m.getBucket(key)
 	gpace := g.pace(want)
@@ -245,6 +248,7 @@ func (m *Manager) Snapshot() Snapshot {
 	snap.InvalidEvents = m.guard.count(time.Now())
 	snap.RateLimitsAvoided = m.avoided.Load()
 	snap.RateLimitsHit = m.hits.Load()
+	snap.TotalRequests = m.total.Load()
 	return snap
 }
 
