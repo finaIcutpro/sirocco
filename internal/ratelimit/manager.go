@@ -114,10 +114,22 @@ func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (re
 	b := m.getBucket(key)
 	// heuristic precheck to avoid first-hit 429s
 	_ = b.precheckHeuristic(route, want)
+	gpace := g.pace(want)
 	gwait := g.when(want)
+	if gpace > gwait {
+		gwait = gpace
+	}
 	bwait := b.when(want)
 	if bwait > gwait {
 		gwait = bwait
+	}
+	bsoft := b.softDelay(want)
+	if bsoft > gwait {
+		gwait = bsoft
+	}
+	gsoft := g.softDelay(want)
+	if gsoft > gwait {
+		gwait = gsoft
 	}
 	extra := m.guard.delay(want)
 	if extra > gwait {
@@ -145,6 +157,7 @@ func (m *Manager) buildReleaseFunc(b *bucket, g *global, token, route string, le
 type releaseMeta struct {
 	scope      string
 	bucketID   string
+	limit      int
 	remaining  int
 	resetAfter float64
 	retryAfter float64
@@ -161,6 +174,7 @@ func parseReleaseMeta(headers map[string]string) releaseMeta {
 	return releaseMeta{
 		scope:      scope,
 		bucketID:   headers["x-ratelimit-bucket"],
+		limit:      parseInt(headers["x-ratelimit-limit"]),
 		remaining:  parseInt(headers["x-ratelimit-remaining"]),
 		resetAfter: parseFloatSeconds(headers["x-ratelimit-reset-after"]),
 		retryAfter: parseFloatSeconds(headers["retry-after"]),
@@ -205,7 +219,7 @@ func (m *Manager) updateLimiters(g *global, b *bucket, token string, success boo
 		m.log.Debug().Str("token", util.MaskToken(token)).Float64("retryAfter", meta.retryAfter).Msg("global rate limit hit")
 		return
 	}
-	b.commit(meta.remaining, meta.resetAfter, meta.retryAfter)
+	b.commit(meta.limit, meta.remaining, meta.resetAfter, meta.retryAfter)
 	if success {
 		g.commitSuccess()
 	}
@@ -370,14 +384,30 @@ func (b *bucket) when(now time.Time) time.Duration {
 	return 0
 }
 
-func (b *bucket) commit(remaining int, resetAfterSec, retryAfterSec float64) {
+func (b *bucket) commit(limit, remaining int, resetAfterSec, retryAfterSec float64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := time.Now()
+	targetGrace := 0
+	if limit > 0 {
+		b.cap = limit
+		// allow a small negative grace to absorb burst jitter without instant blocking
+		targetGrace = limit / 5
+		if targetGrace < 1 {
+			targetGrace = 1
+		}
+	}
 	if retryAfterSec > 0 {
 		b.reset = now.Add(dur(retryAfterSec))
 		b.remaining = 0
-		b.grace = 0
+		if targetGrace > 0 {
+			b.grace = targetGrace
+		} else if b.grace > 1 {
+			b.grace = b.grace / 2
+			if b.grace < 1 {
+				b.grace = 1
+			}
+		}
 		return
 	}
 	if resetAfterSec > 0 {
@@ -386,7 +416,12 @@ func (b *bucket) commit(remaining int, resetAfterSec, retryAfterSec float64) {
 		if b.remaining < 0 {
 			b.remaining = 0
 		}
-		b.grace = 0
+		if targetGrace > b.grace {
+			b.grace = targetGrace
+		}
+		if b.cap > 0 && b.remaining > b.cap {
+			b.remaining = b.cap
+		}
 		return
 	}
 }
@@ -433,6 +468,49 @@ func (b *bucket) enter() (leave func()) {
 	}
 }
 
+// softDelay adds jitter when a bucket is nearly depleted to avoid hard limit hits.
+func (b *bucket) softDelay(now time.Time) time.Duration {
+	b.mu.Lock()
+	cap := b.cap
+	remaining := b.remaining
+	reset := b.reset
+	b.mu.Unlock()
+	if cap <= 0 {
+		return 0
+	}
+	if reset.IsZero() || now.After(reset) {
+		return 0
+	}
+	if remaining < 0 {
+		remaining = 0
+	}
+	threshold := cap / 5
+	if threshold < 1 {
+		threshold = 1
+	}
+	if remaining > threshold {
+		return 0
+	}
+	windowLeft := reset.Sub(now)
+	if windowLeft <= 0 {
+		return 0
+	}
+	ratio := float64(threshold-remaining+1) / float64(threshold+1)
+	wait := time.Duration(ratio * float64(windowLeft) * 0.3)
+	if wait < time.Millisecond {
+		wait = time.Millisecond
+	}
+	low := wait / 2
+	if low < time.Millisecond {
+		low = time.Millisecond
+	}
+	high := wait + low
+	if high <= low {
+		high = low + time.Millisecond
+	}
+	return util.JitterDuration(low, high)
+}
+
 // precheckHeuristic seeds/reset remaining based on known Discord limits for route if not already armed
 func (b *bucket) precheckHeuristic(route string, now time.Time) time.Duration {
 	b.mu.Lock()
@@ -462,6 +540,15 @@ func (b *bucket) precheckHeuristic(route string, now time.Time) time.Duration {
 	if b.grace == 0 {
 		b.grace = 1
 	}
+	if b.cap > 0 {
+		inferredGrace := b.cap / 5
+		if inferredGrace < 1 {
+			inferredGrace = 1
+		}
+		if inferredGrace > b.grace {
+			b.grace = inferredGrace
+		}
+	}
 	return 0
 }
 
@@ -473,6 +560,7 @@ type global struct {
 	used     int
 	succ     int
 	lastTune time.Time
+	next     time.Time
 }
 
 func (g *global) when(now time.Time) time.Duration {
@@ -481,6 +569,9 @@ func (g *global) when(now time.Time) time.Duration {
 	if now.After(g.window) {
 		g.window = now.Add(time.Second)
 		g.used = 0
+		if now.After(g.next) {
+			g.next = now
+		}
 	}
 	if g.used < g.rps {
 		return 0
@@ -488,6 +579,27 @@ func (g *global) when(now time.Time) time.Duration {
 	return g.window.Sub(now)
 }
 
+// pace enforces a minimum spacing between requests based on the current RPS budget.
+func (g *global) pace(now time.Time) time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.rps <= 0 {
+		return 0
+	}
+	spacing := time.Second / time.Duration(g.rps)
+	if spacing <= 0 {
+		spacing = time.Millisecond
+	}
+	if now.Before(g.next) {
+		wait := g.next.Sub(now)
+		g.next = g.next.Add(spacing)
+		return wait
+	}
+	g.next = now.Add(spacing)
+	return 0
+}
+
+// commitGlobal applies Discord global retry-after signals and tunes the limiter.
 func (g *global) commitGlobal(retryAfterSec float64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -495,6 +607,7 @@ func (g *global) commitGlobal(retryAfterSec float64) {
 	if retryAfterSec > 0 {
 		g.window = now.Add(dur(retryAfterSec))
 		g.used = g.rps // block until window
+		g.next = g.window
 		// tune down softly
 		if g.rps > 1 {
 			dec := g.rps / 20
@@ -502,10 +615,16 @@ func (g *global) commitGlobal(retryAfterSec float64) {
 				dec = 1
 			}
 			g.rps -= dec
+			if g.rps < 1 {
+				g.rps = 1
+			}
 		}
 	} else if now.After(g.window) {
 		g.window = now.Add(time.Second)
 		g.used = 0
+		if now.After(g.next) {
+			g.next = now
+		}
 	}
 }
 
@@ -515,12 +634,55 @@ func (g *global) commitSuccess() {
 	g.used++
 	g.succ++
 	now := time.Now()
+	if now.After(g.next) {
+		g.next = now
+	}
 	if now.Sub(g.lastTune) > time.Second && g.succ >= g.rps {
 		// gentle ramp up
 		g.rps++
 		g.succ = 0
 		g.lastTune = now
 	}
+}
+
+// softDelay nudges callers to back off before fully exhausting the global budget.
+func (g *global) softDelay(now time.Time) time.Duration {
+	g.mu.Lock()
+	window := g.window
+	used := g.used
+	rps := g.rps
+	g.mu.Unlock()
+	if rps <= 0 {
+		return 0
+	}
+	if now.After(window) || window.IsZero() {
+		return 0
+	}
+	remaining := rps - used
+	if remaining < 0 {
+		remaining = 0
+	}
+	threshold := rps / 5
+	if threshold < 1 {
+		threshold = 1
+	}
+	if remaining > threshold {
+		return 0
+	}
+	windowLeft := window.Sub(now)
+	if windowLeft <= 0 {
+		return 0
+	}
+	ratio := float64(threshold-remaining+1) / float64(threshold+1)
+	wait := time.Duration(ratio * float64(windowLeft) * 0.3)
+	if wait < time.Millisecond {
+		wait = time.Millisecond
+	}
+	maxWait := wait + windowLeft/time.Duration(threshold+1)
+	if maxWait <= wait {
+		maxWait = wait + time.Millisecond
+	}
+	return util.JitterDuration(wait, maxWait)
 }
 
 // Helpers
@@ -646,6 +808,7 @@ func (m *Manager) stateLoop() {
 				if m.flushState() {
 					m.stateDirty.Store(false)
 					lastFlush = time.Now()
+					_ = lastFlush
 				}
 			}
 		case <-m.stateSignal:
@@ -658,11 +821,13 @@ func (m *Manager) stateLoop() {
 			if m.flushState() {
 				m.stateDirty.Store(false)
 				lastFlush = time.Now()
+				_ = lastFlush
 			}
 		case <-m.stateStop:
 			if m.stateDirty.Load() {
 				if m.flushState() {
 					lastFlush = time.Now()
+					_ = lastFlush
 				}
 				m.stateDirty.Store(false)
 			}
