@@ -115,7 +115,6 @@ func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (re
 	if bwait > gwait {
 		gwait = bwait
 	}
-	// Add protective backoff if nearing invalid request thresholds
 	extra := m.guard.delay(want)
 	if extra > gwait {
 		gwait = extra
@@ -125,62 +124,94 @@ func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (re
 		m.log.Debug().Dur("wait", gwait).Str("key", key).Str("token", maskToken(token)).Str("route", route).Msg("rate limiting request")
 	}
 	b.consume()
+	return m.buildReleaseFunc(b, g, token, route, leave), gwait
+}
+
+func (m *Manager) buildReleaseFunc(b *bucket, g *global, token, route string, leave func()) func(bool, map[string]string) {
 	return func(success bool, headers map[string]string) {
-		// Parse headers
-		scope := strings.ToLower(headers["x-ratelimit-scope"]) // global | shared | user
-		bucketID := headers["x-ratelimit-bucket"]
-		remaining := parseInt(headers["x-ratelimit-remaining"])             // tends to be integer string
-		resetAfter := parseFloatSeconds(headers["x-ratelimit-reset-after"]) // seconds
-		retryAfter := parseFloatSeconds(headers["retry-after"])             // seconds, may be ms in older
-		status := parseInt(headers["x-sirocco-status"])                     // injected by transport
-
-		if bucketID != "" && route != "" {
-			tokenKey := tokenRouteKey(token)
-			var dirty bool
-			m.mu.Lock()
-			tm := m.routes[route]
-			if tm == nil {
-				tm = make(map[string]string)
-				m.routes[route] = tm
-			}
-			if existing, ok := tm[tokenKey]; !ok || existing != bucketID {
-				tm[tokenKey] = bucketID
-				dirty = true
-			}
-			m.mu.Unlock()
-			if dirty {
-				m.persistRoutesAsync()
-			}
-			if token != "" {
-				m.log.Debug().Str("route", route).Str("token", maskToken(token)).Str("bucketID", bucketID).Msg("learned bucket ID")
-			} else {
-				m.log.Debug().Str("route", route).Str("bucketID", bucketID).Msg("learned bucket ID for unauthenticated route")
-			}
-		}
-
-		// Update global if indicated
-		if scope == "global" || strings.ToLower(headers["x-ratelimit-global"]) == "true" {
-			g.commitGlobal(retryAfter)
-			m.log.Debug().Str("token", maskToken(token)).Float64("retryAfter", retryAfter).Msg("global rate limit hit")
-		} else {
-			// Update bucket arming based on remaining/reset
-			b.commit(remaining, resetAfter, retryAfter)
-			if success {
-				g.commitSuccess()
-			}
-		}
-		// Cloudflare invalid request guard; don't count 429 shared
-		if status == 401 || status == 403 || (status == 429 && scope != "shared") {
-			m.guard.mark(time.Now())
-			m.log.Debug().Int("status", status).Str("scope", scope).Msg("marked invalid request")
-		}
-		// webhook 404s are risky if spamming
-		if status == 404 && strings.HasPrefix(route, "POST /webhooks/:id/") {
-			m.guard.mark(time.Now())
-			m.log.Debug().Str("route", route).Msg("marked webhook 404")
-		}
+		meta := parseReleaseMeta(headers)
+		m.learnBucketFromHeaders(token, route, meta)
+		m.updateLimiters(g, b, token, success, meta)
+		m.markInvalidRequests(route, meta)
 		leave()
-	}, gwait
+	}
+}
+
+type releaseMeta struct {
+	scope      string
+	bucketID   string
+	remaining  int
+	resetAfter float64
+	retryAfter float64
+	status     int
+	isGlobal   bool
+}
+
+func parseReleaseMeta(headers map[string]string) releaseMeta {
+	if headers == nil {
+		return releaseMeta{}
+	}
+	scope := strings.ToLower(headers["x-ratelimit-scope"])
+	globalHint := strings.ToLower(headers["x-ratelimit-global"]) == "true"
+	return releaseMeta{
+		scope:      scope,
+		bucketID:   headers["x-ratelimit-bucket"],
+		remaining:  parseInt(headers["x-ratelimit-remaining"]),
+		resetAfter: parseFloatSeconds(headers["x-ratelimit-reset-after"]),
+		retryAfter: parseFloatSeconds(headers["retry-after"]),
+		status:     parseInt(headers["x-sirocco-status"]),
+		isGlobal:   scope == "global" || globalHint,
+	}
+}
+
+func (m *Manager) learnBucketFromHeaders(token, route string, meta releaseMeta) {
+	if route == "" || meta.bucketID == "" {
+		return
+	}
+	tokenKey := tokenRouteKey(token)
+	var dirty bool
+	m.mu.Lock()
+	tm := m.routes[route]
+	if tm == nil {
+		tm = make(map[string]string)
+		m.routes[route] = tm
+	}
+	if existing, ok := tm[tokenKey]; !ok || existing != meta.bucketID {
+		tm[tokenKey] = meta.bucketID
+		dirty = true
+	}
+	m.mu.Unlock()
+	if dirty {
+		m.persistRoutesAsync()
+	}
+	if token != "" {
+		m.log.Debug().Str("route", route).Str("token", maskToken(token)).Str("bucketID", meta.bucketID).Msg("learned bucket ID")
+		return
+	}
+	m.log.Debug().Str("route", route).Str("bucketID", meta.bucketID).Msg("learned bucket ID for unauthenticated route")
+}
+
+func (m *Manager) updateLimiters(g *global, b *bucket, token string, success bool, meta releaseMeta) {
+	if meta.isGlobal {
+		g.commitGlobal(meta.retryAfter)
+		m.log.Debug().Str("token", maskToken(token)).Float64("retryAfter", meta.retryAfter).Msg("global rate limit hit")
+		return
+	}
+	b.commit(meta.remaining, meta.resetAfter, meta.retryAfter)
+	if success {
+		g.commitSuccess()
+	}
+}
+
+func (m *Manager) markInvalidRequests(route string, meta releaseMeta) {
+	if meta.status == 401 || meta.status == 403 || (meta.status == 429 && meta.scope != "shared") {
+		m.guard.mark(time.Now())
+		m.log.Debug().Int("status", meta.status).Str("scope", meta.scope).Msg("marked invalid request")
+	}
+	if meta.status == 404 && strings.HasPrefix(route, "POST /webhooks/:id/") {
+		m.guard.mark(time.Now())
+		m.log.Debug().Str("route", route).Msg("marked webhook 404")
+	}
 }
 
 // Snapshot returns a summary of limiter state for diagnostics.
