@@ -3,7 +3,6 @@ package validation
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/bytedance/sonic"
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/getkin/kin-openapi/routers"
@@ -66,7 +66,7 @@ func (e *Error) ResponsePayload() []byte {
 		Reason:  e.Reason,
 		Details: e.Details,
 	}
-	data, err := json.Marshal(resp)
+	data, err := sonic.Marshal(resp)
 	if err != nil {
 		// fall back to minimal payload if marshaling fails
 		fallback := fmt.Sprintf(`{"message":"%s","reason":"%s"}`,
@@ -381,8 +381,8 @@ func sanitizeReason(reason string) string {
 }
 
 func jsonEscape(value string) string {
-	buf, err := json.Marshal(value)
-	if err != nil {
+	buf, err := sonic.Marshal(value)
+	if err != nil || len(buf) < 2 {
 		return value
 	}
 	return string(buf[1 : len(buf)-1])

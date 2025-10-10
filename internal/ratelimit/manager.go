@@ -3,7 +3,6 @@ package ratelimit
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
@@ -14,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/rs/zerolog"
 
 	"github.com/melonly/sirocco/internal/config"
@@ -784,7 +784,7 @@ func (m *Manager) loadState() error {
 		return err
 	}
 	var st routeState
-	if err := json.Unmarshal(data, &st); err != nil {
+	if err := sonic.Unmarshal(data, &st); err != nil {
 		return err
 	}
 	if st.Routes == nil {
@@ -868,7 +868,7 @@ func (m *Manager) flushState() bool {
 	}
 	m.mu.RUnlock()
 	st := routeState{Version: routeStateVersion, Routes: snapshot}
-	data, err := json.Marshal(st)
+	data, err := sonic.Marshal(st)
 	if err != nil {
 		m.log.Error().Err(err).Msg("failed to marshal route state")
 		return false

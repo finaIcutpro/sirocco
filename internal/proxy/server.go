@@ -3,7 +3,6 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/rs/zerolog"
 
 	"github.com/melonly/sirocco/internal/config"
@@ -205,13 +205,21 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
+
+	data, err := sonic.Marshal(meta)
+	if err != nil {
+		s.log.Error().Err(err).Msg("failed to encode meta response")
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(meta); err != nil {
-		s.log.Error().Err(err).Msg("failed to encode meta response")
+	if _, err := w.Write(data); err != nil {
+		s.log.Debug().Err(err).Msg("failed to write meta response")
 	}
 }
 

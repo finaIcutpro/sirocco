@@ -29,9 +29,15 @@ func main() {
 	rl := ratelimit.NewManager(cfg, log)
 	defer rl.Close()
 
-	validator, err := validation.New(log)
-	if err != nil {
-		log.Fatal().Err(err).Msg("request validator init failed")
+	var validator *validation.Validator
+	if cfg.ValidationEnabled {
+		var verr error
+		validator, verr = validation.New(log)
+		if verr != nil {
+			log.Fatal().Err(verr).Msg("request validator init failed")
+		}
+	} else {
+		log.Info().Msg("request validation disabled via configuration")
 	}
 
 	// proxy server

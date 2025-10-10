@@ -10,11 +10,12 @@ import (
 )
 
 type Config struct {
-	LogLevel       string
-	BindAddr       string
-	Port           int
-	DiscordBaseURL string // e.g. https://discord.com
-	DisableHTTP2   bool
+	LogLevel          string
+	BindAddr          string
+	Port              int
+	DiscordBaseURL    string // e.g. https://discord.com
+	DisableHTTP2      bool
+	ValidationEnabled bool
 
 	StatePath string
 
@@ -57,6 +58,19 @@ func getdurms(key string, def int) time.Duration {
 	return time.Duration(def) * time.Millisecond
 }
 
+func getbool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		v = strings.ToLower(strings.TrimSpace(v))
+		switch v {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+	}
+	return def
+}
+
 func Load() *Config {
 	c := &Config{
 		LogLevel:           getenv("LOG_LEVEL", "info"),
@@ -64,6 +78,7 @@ func Load() *Config {
 		Port:               getint("PORT", 8080),
 		DiscordBaseURL:     getenv("DISCORD_BASE_URL", "https://discord.com"),
 		DisableHTTP2:       getenv("DISABLE_HTTP_2", "true") == "true",
+		ValidationEnabled:  getbool("SIROCCO_VALIDATION_ENABLED", true),
 		StatePath:          getenv("SIROCCO_STATE_PATH", defaultStatePath()),
 		RequestTimeout:     getdurms("REQUEST_TIMEOUT", 5000),
 		DialTimeout:        getdurms("DIAL_TIMEOUT", 2500),
