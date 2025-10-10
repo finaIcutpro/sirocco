@@ -358,6 +358,7 @@ type bucket struct {
 	window    time.Duration
 	grace     int
 	q         []chan struct{}
+	confirmed bool
 }
 
 func (b *bucket) when(now time.Time) time.Duration {
@@ -388,6 +389,7 @@ func (b *bucket) commit(limit, remaining int, resetAfterSec, retryAfterSec float
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := time.Now()
+	hasSignal := limit > 0 || resetAfterSec > 0 || retryAfterSec > 0
 	targetGrace := 0
 	if limit > 0 {
 		b.cap = limit
@@ -408,6 +410,9 @@ func (b *bucket) commit(limit, remaining int, resetAfterSec, retryAfterSec float
 				b.grace = 1
 			}
 		}
+		if hasSignal {
+			b.confirmed = true
+		}
 		return
 	}
 	if resetAfterSec > 0 {
@@ -422,7 +427,13 @@ func (b *bucket) commit(limit, remaining int, resetAfterSec, retryAfterSec float
 		if b.cap > 0 && b.remaining > b.cap {
 			b.remaining = b.cap
 		}
+		if hasSignal {
+			b.confirmed = true
+		}
 		return
+	}
+	if hasSignal {
+		b.confirmed = true
 	}
 }
 
@@ -474,7 +485,11 @@ func (b *bucket) softDelay(now time.Time) time.Duration {
 	capacity := b.cap
 	remaining := b.remaining
 	reset := b.reset
+	confirmed := b.confirmed
 	b.mu.Unlock()
+	if !confirmed {
+		return 0
+	}
 	if capacity <= 0 {
 		return 0
 	}
@@ -529,6 +544,7 @@ func (b *bucket) precheckHeuristic(route string, now time.Time) time.Duration {
 		if capacity, windowSec, ok := Heuristic(route); ok {
 			b.cap = capacity
 			b.window = dur(windowSec)
+			b.confirmed = false
 		}
 	}
 	if b.cap <= 0 || b.window == 0 {
@@ -549,6 +565,7 @@ func (b *bucket) precheckHeuristic(route string, now time.Time) time.Duration {
 			b.grace = inferredGrace
 		}
 	}
+	b.confirmed = false
 	return 0
 }
 
