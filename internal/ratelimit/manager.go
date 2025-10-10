@@ -35,7 +35,9 @@ type Manager struct {
 	// route = method + " " + normalized path (major ids preserved)
 	routes map[string]map[string]string // route -> token -> bucketID
 
-	guard invalidGuard
+	guard   invalidGuard
+	avoided atomic.Uint64
+	hits    atomic.Uint64
 
 	statePath      string
 	stateSignal    chan struct{}
@@ -47,10 +49,12 @@ type Manager struct {
 
 // Snapshot summarizes manager state for diagnostics.
 type Snapshot struct {
-	Buckets       int `json:"buckets"`
-	Globals       int `json:"globals"`
-	Routes        int `json:"routes"`
-	InvalidEvents int `json:"invalid_events"`
+	Buckets           int    `json:"buckets"`
+	Globals           int    `json:"globals"`
+	Routes            int    `json:"routes"`
+	InvalidEvents     int    `json:"invalid_events"`
+	RateLimitsAvoided uint64 `json:"rate_limits_avoided"`
+	RateLimitsHit     uint64 `json:"rate_limits_hit"`
 }
 
 func NewManager(cfg *config.Config, log zerolog.Logger) *Manager {
@@ -121,6 +125,7 @@ func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (re
 	}
 	leave := b.enter()
 	if gwait > 0 {
+		m.avoided.Add(1)
 		m.log.Debug().Dur("wait", gwait).Str("key", key).Str("token", maskToken(token)).Str("route", route).Msg("rate limiting request")
 	}
 	b.consume()
@@ -192,6 +197,9 @@ func (m *Manager) learnBucketFromHeaders(token, route string, meta releaseMeta) 
 }
 
 func (m *Manager) updateLimiters(g *global, b *bucket, token string, success bool, meta releaseMeta) {
+	if meta.retryAfter > 0 || meta.status == 429 {
+		m.hits.Add(1)
+	}
 	if meta.isGlobal {
 		g.commitGlobal(meta.retryAfter)
 		m.log.Debug().Str("token", maskToken(token)).Float64("retryAfter", meta.retryAfter).Msg("global rate limit hit")
@@ -223,6 +231,8 @@ func (m *Manager) Snapshot() Snapshot {
 	snap.Routes = len(m.routes)
 	m.mu.RUnlock()
 	snap.InvalidEvents = m.guard.count(time.Now())
+	snap.RateLimitsAvoided = m.avoided.Load()
+	snap.RateLimitsHit = m.hits.Load()
 	return snap
 }
 
