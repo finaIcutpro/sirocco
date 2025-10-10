@@ -28,6 +28,7 @@ a single go binary that keeps discord rest buckets warm, retries the flaky edge 
 - large, pre-tuned http pool (tls12+, 512 idle slots, per-host caps) with optional outbound ip pinning.
 - invalid-request guard that throttles before cloudflare does, now visible through the meta endpoint.
 - smart rate-limit heuristics with fifo bucket queues so bursts stay smooth even at large scale.
+- blocks malformed requests using Discord's OpenAPI spec before they reach upstream, preventing 400/401/403 storms and reducing unnecessary load. (requires VALIDATION_ENABLED env var)
 
 ## Performance
 
@@ -51,6 +52,8 @@ a single go binary that keeps discord rest buckets warm, retries the flaky edge 
 - **health:** `get /_sirocco/health` → `200 ok` if the listener is up.
 - **meta:** `get /_sirocco/meta` → json with uptime, bucket/global counts, retry settings, and state path.
 - **response headers:** every proxied request includes `x-sirocco-waited`, `x-sirocco-planned-wait`, `x-sirocco-upstream-status`, and retry counts.
+- **validation stats:** meta endpoint includes validation metrics when enabled (`validation_enabled`, `validation_requests`, `validation_blocked`, `validation_block_rate`, `validation_top_reasons`).
+- **blocked requests:** invalid requests return `400 Bad Request` with `x-sirocco-validation: blocked` header and JSON error details.
 - **env overrides:**
 
   | variable | default | notes |
@@ -62,6 +65,7 @@ a single go binary that keeps discord rest buckets warm, retries the flaky edge 
   | `UPSTREAM_RETRY_BASE_DELAY` | `200` ms | jittered exponential backoff floor |
   | `UPSTREAM_RETRY_MAX_DELAY` | `2000` ms | backoff ceiling |
   | `BOT_RATELIMIT_OVERRIDES` | unset | `token:rps` pairs for global overrides |
+  | `VALIDATION_ENABLED` | `true` | enable/disable request validation against Discord OpenAPI spec |
   | `LOG_LEVEL` | `info` | zerolog level |
 
 that's it—ship the binary, aim your shards at it, and let sirocco keep your discord rest traffic fast, safe, and hands-off.
