@@ -78,15 +78,15 @@ func Load() *Config {
 		Port:               getint("PORT", 8080),
 		DiscordBaseURL:     getenv("DISCORD_BASE_URL", "https://discord.com"),
 		DisableHTTP2:       getenv("DISABLE_HTTP_2", "true") == "true",
-		ValidationEnabled:  getbool("SIROCCO_VALIDATION_ENABLED", true),
-		StatePath:          getenv("SIROCCO_STATE_PATH", defaultStatePath()),
+		ValidationEnabled:  getbool("VALIDATION_ENABLED", true),
+		StatePath:          getenv("STATE_PATH", defaultStatePath()),
 		RequestTimeout:     getdurms("REQUEST_TIMEOUT", 5000),
 		DialTimeout:        getdurms("DIAL_TIMEOUT", 2500),
 		IdleConnTimeout:    getdurms("IDLE_CONN_TIMEOUT", 90000),
 		MaxUpstreamRetries: getint("UPSTREAM_RETRY_LIMIT", 3),
 		RetryBaseDelay:     getdurms("UPSTREAM_RETRY_BASE_DELAY", 200),
 		RetryMaxDelay:      getdurms("UPSTREAM_RETRY_MAX_DELAY", 2000),
-		GlobalOverride:     parseOverrides(getenv("BOT_RATELIMIT_OVERRIDES", "")),
+		GlobalOverride:     parseOverrides(getenv("RATELIMIT_OVERRIDES", "")),
 	}
 	if ip := net.ParseIP(getenv("OUTBOUND_IP", "")); ip != nil {
 		c.OutboundIP = ip
