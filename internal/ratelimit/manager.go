@@ -112,8 +112,6 @@ func (m *Manager) Plan(method, path, token string) (bucketKey, route string) {
 func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (release func(success bool, headers map[string]string), wait time.Duration) {
 	g := m.getGlobal(token)
 	b := m.getBucket(key)
-	// heuristic precheck to avoid first-hit 429s
-	_ = b.precheckHeuristic(route, want)
 	gpace := g.pace(want)
 	gwait := g.when(want)
 	if gpace > gwait {
@@ -524,49 +522,6 @@ func (b *bucket) softDelay(now time.Time) time.Duration {
 		high = low + time.Millisecond
 	}
 	return util.JitterDuration(low, high)
-}
-
-// precheckHeuristic seeds/reset remaining based on known Discord limits for route if not already armed
-func (b *bucket) precheckHeuristic(route string, now time.Time) time.Duration {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	// if server already armed by headers or existing window, respect those
-	if now.Before(b.reset) {
-		if b.remaining > 0 {
-			return 0
-		}
-		if b.grace > 0 && b.remaining > -b.grace {
-			return 0
-		}
-		return b.reset.Sub(now)
-	}
-	if b.cap == 0 || b.window == 0 {
-		if capacity, windowSec, ok := Heuristic(route); ok {
-			b.cap = capacity
-			b.window = dur(windowSec)
-			b.confirmed = false
-		}
-	}
-	if b.cap <= 0 || b.window == 0 {
-		return 0
-	}
-	// Start a new window if expired
-	b.reset = now.Add(b.window)
-	b.remaining = b.cap
-	if b.grace == 0 {
-		b.grace = 1
-	}
-	if b.cap > 0 {
-		inferredGrace := b.cap / 5
-		if inferredGrace < 1 {
-			inferredGrace = 1
-		}
-		if inferredGrace > b.grace {
-			b.grace = inferredGrace
-		}
-	}
-	b.confirmed = false
-	return 0
 }
 
 // global simple token bucket style based on RPS
