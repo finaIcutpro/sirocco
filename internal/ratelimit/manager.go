@@ -513,7 +513,7 @@ func (b *bucket) softDelay(now time.Time) time.Duration {
 		return 0
 	}
 	ratio := float64(threshold-remaining+1) / float64(threshold+1)
-	wait := time.Duration(ratio * float64(windowLeft) * 0.3)
+	wait := time.Duration(ratio * float64(windowLeft) * 0.1)
 	if wait < time.Millisecond {
 		wait = time.Millisecond
 	}
@@ -650,7 +650,7 @@ func (g *global) softDelay(now time.Time) time.Duration {
 		return 0
 	}
 	ratio := float64(threshold-remaining+1) / float64(threshold+1)
-	wait := time.Duration(ratio * float64(windowLeft) * 0.3)
+	wait := time.Duration(ratio * float64(windowLeft) * 0.1)
 	if wait < time.Millisecond {
 		wait = time.Millisecond
 	}
