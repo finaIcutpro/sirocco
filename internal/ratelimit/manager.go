@@ -32,6 +32,8 @@ type Manager struct {
 	total   atomic.Uint64
 }
 
+const retryAfterBuffer = 50 * time.Millisecond
+
 // Snapshot returns a summary of limiter state for diagnostics.
 type Snapshot struct {
 	Buckets           int    `json:"buckets"`
@@ -320,16 +322,10 @@ func (b *bucket) commit(limit, remaining int, resetAfterSec, retryAfterSec float
 		}
 	}
 	if retryAfterSec > 0 {
-		b.reset = now.Add(dur(retryAfterSec))
+		b.reset = now.Add(dur(retryAfterSec) + retryAfterBuffer)
 		b.remaining = 0
-		if targetGrace > 0 {
-			b.grace = targetGrace
-		} else if b.grace > 1 {
-			b.grace = b.grace / 2
-			if b.grace < 1 {
-				b.grace = 1
-			}
-		}
+		// disable grace while honoring a hard retry-after to prevent immediate replays
+		b.grace = 0
 		if hasSignal {
 			b.confirmed = true
 		}
@@ -435,7 +431,7 @@ func (g *global) commitGlobal(retryAfterSec float64) {
 	defer g.mu.Unlock()
 	now := time.Now()
 	if retryAfterSec > 0 {
-		g.window = now.Add(dur(retryAfterSec))
+		g.window = now.Add(dur(retryAfterSec) + retryAfterBuffer)
 		g.used = g.rps // block until window
 		g.next = g.window
 		// tune down softly
