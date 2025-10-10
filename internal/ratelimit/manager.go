@@ -79,8 +79,8 @@ func NewManager(cfg *config.Config, log zerolog.Logger) *Manager {
 	return m
 }
 
-// Plan returns the owner selection key, the bucket key to use for Acquire, and the normalized route pattern
-func (m *Manager) Plan(method, path, token string) (ownerKey, bucketKey, route string) {
+// Plan returns the bucket key and normalized route pattern used for limiter coordination.
+func (m *Manager) Plan(method, path, token string) (bucketKey, route string) {
 	route = NormalizeRoute(method, path)
 	var bucketID string
 	tokenKey := tokenRouteKey(token)
@@ -93,19 +93,19 @@ func (m *Manager) Plan(method, path, token string) (ownerKey, bucketKey, route s
 		// unauthenticated or webhook
 		if bucketID != "" {
 			m.log.Debug().Str("route", route).Str("bucketID", bucketID).Msg("planning unauthenticated request with bucket")
-			return "b::" + bucketID, "b::" + bucketID, route
+			return "b::" + bucketID, route
 		}
 		m.log.Debug().Str("route", route).Msg("planning unauthenticated request")
-		return "r::" + route, "r::" + route, route
+		return "r::" + route, route
 	}
 	if bucketID != "" {
 		bk := "b:" + tokenKey + ":" + bucketID
-		m.log.Debug().Str("route", route).Str("token", maskToken(token)).Str("bucketID", bucketID).Msg("planning request with learned bucket")
-		return bk, bk, route
+		m.log.Debug().Str("route", route).Str("token", util.MaskToken(token)).Str("bucketID", bucketID).Msg("planning request with learned bucket")
+		return bk, route
 	}
-	// default to token affinity for owner, and token-scoped route bucket
-	m.log.Debug().Str("route", route).Str("token", maskToken(token)).Msg("planning request with token affinity")
-	return "g:" + tokenKey, "r:" + tokenKey + ":" + route, route
+	// default to token affinity for route-scoped buckets when no bucket has been learned yet
+	m.log.Debug().Str("route", route).Str("token", util.MaskToken(token)).Msg("planning request with token affinity")
+	return "r:" + tokenKey + ":" + route, route
 }
 
 // AcquireWithRoute is like Acquire but also knows the route for header learning on commit
@@ -126,7 +126,7 @@ func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (re
 	leave := b.enter()
 	if gwait > 0 {
 		m.avoided.Add(1)
-		m.log.Debug().Dur("wait", gwait).Str("key", key).Str("token", maskToken(token)).Str("route", route).Msg("rate limiting request")
+		m.log.Debug().Dur("wait", gwait).Str("key", key).Str("token", util.MaskToken(token)).Str("route", route).Msg("rate limiting request")
 	}
 	b.consume()
 	return m.buildReleaseFunc(b, g, token, route, leave), gwait
@@ -190,7 +190,7 @@ func (m *Manager) learnBucketFromHeaders(token, route string, meta releaseMeta) 
 		m.persistRoutesAsync()
 	}
 	if token != "" {
-		m.log.Debug().Str("route", route).Str("token", maskToken(token)).Str("bucketID", meta.bucketID).Msg("learned bucket ID")
+		m.log.Debug().Str("route", route).Str("token", util.MaskToken(token)).Str("bucketID", meta.bucketID).Msg("learned bucket ID")
 		return
 	}
 	m.log.Debug().Str("route", route).Str("bucketID", meta.bucketID).Msg("learned bucket ID for unauthenticated route")
@@ -202,7 +202,7 @@ func (m *Manager) updateLimiters(g *global, b *bucket, token string, success boo
 	}
 	if meta.isGlobal {
 		g.commitGlobal(meta.retryAfter)
-		m.log.Debug().Str("token", maskToken(token)).Float64("retryAfter", meta.retryAfter).Msg("global rate limit hit")
+		m.log.Debug().Str("token", util.MaskToken(token)).Float64("retryAfter", meta.retryAfter).Msg("global rate limit hit")
 		return
 	}
 	b.commit(meta.remaining, meta.resetAfter, meta.retryAfter)
@@ -285,7 +285,8 @@ func (g *invalidGuard) compact(now time.Time) {
 		i++
 	}
 	if i > 0 {
-		g.events = append([]time.Time{}, g.events[i:]...)
+		copy(g.events, g.events[i:])
+		g.events = g.events[:len(g.events)-i]
 	}
 }
 
@@ -575,13 +576,6 @@ func isSnowflake(s string) bool {
 	return len(s) >= 5
 }
 
-func maskToken(token string) string {
-	if len(token) <= 4 {
-		return token
-	}
-	return token[:4] + strings.Repeat("*", len(token)-4)
-}
-
 const routeStateVersion = 1
 
 var stateFlushInterval = time.Second
@@ -644,19 +638,32 @@ func (m *Manager) stateLoop() {
 	ticker := time.NewTicker(stateFlushInterval)
 	defer ticker.Stop()
 	defer m.stateWG.Done()
+	var lastFlush time.Time
 	for {
 		select {
 		case <-ticker.C:
 			if m.stateDirty.Load() {
 				if m.flushState() {
 					m.stateDirty.Store(false)
+					lastFlush = time.Now()
 				}
 			}
 		case <-m.stateSignal:
-			// mark dirty already handled in persistRoutesAsync; rely on ticker for batching
+			if !m.stateDirty.Load() {
+				continue
+			}
+			if !lastFlush.IsZero() && time.Since(lastFlush) < stateFlushInterval {
+				continue
+			}
+			if m.flushState() {
+				m.stateDirty.Store(false)
+				lastFlush = time.Now()
+			}
 		case <-m.stateStop:
 			if m.stateDirty.Load() {
-				m.flushState()
+				if m.flushState() {
+					lastFlush = time.Now()
+				}
 				m.stateDirty.Store(false)
 			}
 			return
@@ -679,7 +686,7 @@ func (m *Manager) flushState() bool {
 	}
 	m.mu.RUnlock()
 	st := routeState{Version: routeStateVersion, Routes: snapshot}
-	data, err := json.MarshalIndent(st, "", "  ")
+	data, err := json.Marshal(st)
 	if err != nil {
 		m.log.Error().Err(err).Msg("failed to marshal route state")
 		return false

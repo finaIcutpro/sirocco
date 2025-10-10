@@ -1,8 +1,7 @@
 package util
 
 import (
-	"crypto/rand"
-	"math/big"
+	"math/rand"
 	"time"
 )
 
@@ -21,9 +20,6 @@ func JitterDuration(minDur, maxDur time.Duration) time.Duration {
 		}
 		return minDur
 	}
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(span)))
-	if err != nil {
-		return maxDur
-	}
-	return minDur + time.Duration(n.Int64())
+	n := rand.Int63n(int64(span))
+	return minDur + time.Duration(n)
 }

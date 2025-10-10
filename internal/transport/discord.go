@@ -86,18 +86,19 @@ func (d *DiscordClient) Do(ctx context.Context, in *http.Request, body []byte) (
 			d.log.Error().Err(err).Str("method", in.Method).Str("url", upstreamURL.String()).Msg("failed to create upstream request")
 			return nil, nil, err
 		}
-		d.log.Debug().Str("method", in.Method).Str("url", upstreamURL.String()).Int("attempt", attempts).Msg("sending upstream request")
+		upstreamStr := upstreamURL.String()
+		d.log.Debug().Str("method", in.Method).Str("url", upstreamStr).Int("attempt", attempts).Msg("sending upstream request")
 		upstreamStart := time.Now()
 		resp, err := d.hc.Do(req)
 		if err != nil {
 			if !d.shouldRetryError(in.Method, err, attempts) {
-				d.log.Error().Err(err).Str("method", in.Method).Str("url", upstreamURL.String()).Msg("upstream request failed")
+				d.log.Error().Err(err).Str("method", in.Method).Str("url", upstreamStr).Msg("upstream request failed")
 				return nil, nil, err
 			}
 			attempts++
 			backoff := d.nextBackoff(attempts)
-			d.log.Warn().Err(err).Str("method", in.Method).Str("url", upstreamURL.String()).Int("attempt", attempts).Dur("backoff", backoff).Msg("retrying after upstream error")
-			if err := waitContext(ctx, backoff); err != nil {
+			d.log.Warn().Err(err).Str("method", in.Method).Str("url", upstreamStr).Int("attempt", attempts).Dur("backoff", backoff).Msg("retrying after upstream error")
+			if err := util.WaitContext(ctx, backoff); err != nil {
 				return nil, nil, err
 			}
 			continue
@@ -113,13 +114,13 @@ func (d *DiscordClient) Do(ctx context.Context, in *http.Request, body []byte) (
 			resp.Body.Close()
 			attempts++
 			backoff := d.nextBackoff(attempts)
-			d.log.Warn().Int("status", resp.StatusCode).Str("method", in.Method).Str("url", upstreamURL.String()).Int("attempt", attempts).Dur("backoff", backoff).Msg("retrying after upstream status")
-			if err := waitContext(ctx, backoff); err != nil {
+			d.log.Warn().Int("status", resp.StatusCode).Str("method", in.Method).Str("url", upstreamStr).Int("attempt", attempts).Dur("backoff", backoff).Msg("retrying after upstream status")
+			if err := util.WaitContext(ctx, backoff); err != nil {
 				return nil, nil, err
 			}
 			continue
 		}
-		d.log.Debug().Int("status", resp.StatusCode).Str("method", in.Method).Str("url", upstreamURL.String()).Dur("latency", latency).Int("retries", attempts).Msg("upstream response")
+		d.log.Debug().Int("status", resp.StatusCode).Str("method", in.Method).Str("url", upstreamStr).Dur("latency", latency).Int("retries", attempts).Msg("upstream response")
 		return resp, hdr, nil
 	}
 }
@@ -224,20 +225,6 @@ func (d *DiscordClient) nextBackoff(attempt int) time.Duration {
 		minBackoff = wait
 	}
 	return util.JitterDuration(minBackoff, wait)
-}
-
-func waitContext(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		return nil
-	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 func captureHeaders(h http.Header) map[string]string {

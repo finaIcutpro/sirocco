@@ -61,7 +61,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := extractToken(r)
-	s.log.Debug().Str("method", r.Method).Str("path", r.URL.Path).Str("token", maskToken(token)).Msg("incoming request")
+	s.log.Debug().Str("method", r.Method).Str("path", r.URL.Path).Str("token", util.MaskToken(token)).Msg("incoming request")
 
 	// buffer body for reuse across forward/upstream
 	var body []byte
@@ -77,7 +77,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
 
-	_, bucketKey, route := s.rl.Plan(r.Method, r.URL.Path, token)
+	bucketKey, route := s.rl.Plan(r.Method, r.URL.Path, token)
 	s.handleUpstream(w, r, bucketKey, token, body, route)
 }
 
@@ -87,7 +87,7 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request, key, tok
 	release, plannedWait := s.rl.AcquireWithRoute(key, token, route, acquireStart)
 	if plannedWait > 0 {
 		s.log.Debug().Dur("wait", plannedWait).Str("key", key).Msg("rate limit wait")
-		if err := waitWithContext(r.Context(), plannedWait); err != nil {
+		if err := util.WaitContext(r.Context(), plannedWait); err != nil {
 			release(false, nil)
 			s.log.Debug().Err(err).Str("bucketKey", key).Str("route", route).Msg("request canceled while waiting for rate limit")
 			return
@@ -127,13 +127,6 @@ func extractToken(r *http.Request) string {
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
-
-func maskToken(token string) string {
-	if len(token) <= 4 {
-		return token
-	}
-	return token[:4] + strings.Repeat("*", len(token)-4)
-}
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -330,18 +323,4 @@ func formatDurationSeconds(d time.Duration) string {
 		d = 0
 	}
 	return strconv.FormatFloat(d.Seconds(), 'f', 3, 64)
-}
-
-func waitWithContext(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		return nil
-	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
