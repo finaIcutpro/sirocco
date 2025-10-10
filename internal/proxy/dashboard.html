@@ -208,16 +208,12 @@
                         <td>{{.Globals}}</td>
                     </tr>
                     <tr>
-                        <th scope="row">Learned Routes</th>
-                        <td>{{.Routes}}</td>
+                        <th scope="row">Total Requests</th>
+                        <td>{{.TotalRequests}}</td>
                     </tr>
                     <tr>
                         <th scope="row">Invalid Events (10m)</th>
                         <td>{{.InvalidEvents}}</td>
-                    </tr>
-                    <tr>
-                        <th scope="row">Route Cache</th>
-                        <td>{{.RouteCacheStatus}}{{if .RouteCachePersisted}} · <small>{{.StatePath}}</small>{{end}}</td>
                     </tr>
                     <tr>
                         <th scope="row">Bot Overrides</th>

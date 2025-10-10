@@ -237,9 +237,7 @@ type dashboardView struct {
 	Buckets             int
 	Globals             int
 	InvalidEvents       int
-	RouteCacheStatus    string
-	RouteCachePersisted bool
-	StatePath           string
+	TotalRequests       uint64
 	BotOverrides        int
 	MaxUpstreamRetries  int
 	RetryBase           string
@@ -310,9 +308,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		Buckets:             snap.Buckets,
 		Globals:             snap.Globals,
 		InvalidEvents:       snap.InvalidEvents,
-		RouteCacheStatus:    ternaryString(s.cfg.StatePath != "", "Persisted", "Disabled"),
-		RouteCachePersisted: s.cfg.StatePath != "",
-		StatePath:           s.cfg.StatePath,
+		TotalRequests:       snap.TotalRequests,
 		BotOverrides:        len(s.cfg.GlobalOverride),
 		MaxUpstreamRetries:  s.cfg.MaxUpstreamRetries,
 		RetryBase:           s.cfg.RetryBaseDelay.String(),
