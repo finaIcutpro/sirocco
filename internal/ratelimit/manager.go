@@ -471,11 +471,11 @@ func (b *bucket) enter() (leave func()) {
 // softDelay adds jitter when a bucket is nearly depleted to avoid hard limit hits.
 func (b *bucket) softDelay(now time.Time) time.Duration {
 	b.mu.Lock()
-	cap := b.cap
+	capacity := b.cap
 	remaining := b.remaining
 	reset := b.reset
 	b.mu.Unlock()
-	if cap <= 0 {
+	if capacity <= 0 {
 		return 0
 	}
 	if reset.IsZero() || now.After(reset) {
@@ -484,7 +484,7 @@ func (b *bucket) softDelay(now time.Time) time.Duration {
 	if remaining < 0 {
 		remaining = 0
 	}
-	threshold := cap / 5
+	threshold := capacity / 5
 	if threshold < 1 {
 		threshold = 1
 	}
