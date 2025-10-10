@@ -1,4 +1,4 @@
-# sirocco [![CodeFactor](https://www.codefactor.io/repository/github/noahcxrest/siorocco/badge)](https://www.codefactor.io/repository/github/noahcxrest/siorocco)
+# sirocco [![CodeFactor](https://www.codefactor.io/repository/github/noahcxrest/sirocco/badge)](https://www.codefactor.io/repository/github/noahcxrest/sirocco)
 
 a single go binary that keeps discord rest buckets warm, retries the flaky edge for you, and surfaces the wait math right in the response so your bot can just send traffic. cuts ratelimits down by over 90%.
 
