@@ -124,10 +124,6 @@ func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (re
 	if bwait > gwait {
 		gwait = bwait
 	}
-	bsoft := b.softDelay(want)
-	if bsoft > gwait {
-		gwait = bsoft
-	}
 	gsoft := g.softDelay(want)
 	if gsoft > gwait {
 		gwait = gsoft
@@ -141,7 +137,6 @@ func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (re
 		m.avoided.Add(1)
 		m.log.Debug().Dur("wait", gwait).Str("key", key).Str("token", util.MaskToken(token)).Str("route", route).Msg("rate limiting request")
 	}
-	b.consume()
 	return m.buildReleaseFunc(b, g, token, route, leave), gwait
 }
 
@@ -357,7 +352,6 @@ type bucket struct {
 	reset     time.Time
 	remaining int
 	cap       int
-	window    time.Duration
 	grace     int
 	q         []chan struct{}
 	confirmed bool
@@ -439,23 +433,6 @@ func (b *bucket) commit(limit, remaining int, resetAfterSec, retryAfterSec float
 	}
 }
 
-func (b *bucket) consume() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.cap == 0 && b.window == 0 {
-		return
-	}
-	if b.grace > 0 {
-		if b.remaining > -b.grace {
-			b.remaining--
-		}
-		return
-	}
-	if b.remaining > 0 {
-		b.remaining--
-	}
-}
-
 // enter enforces strict FIFO for requests within a bucket
 func (b *bucket) enter() (leave func()) {
 	ch := make(chan struct{})
@@ -479,53 +456,6 @@ func (b *bucket) enter() (leave func()) {
 		}
 		b.mu.Unlock()
 	}
-}
-
-// softDelay adds jitter when a bucket is nearly depleted to avoid hard limit hits.
-func (b *bucket) softDelay(now time.Time) time.Duration {
-	b.mu.Lock()
-	capacity := b.cap
-	remaining := b.remaining
-	reset := b.reset
-	confirmed := b.confirmed
-	b.mu.Unlock()
-	if !confirmed {
-		return 0
-	}
-	if capacity <= 0 {
-		return 0
-	}
-	if reset.IsZero() || now.After(reset) {
-		return 0
-	}
-	if remaining < 0 {
-		remaining = 0
-	}
-	threshold := capacity / 5
-	if threshold < 1 {
-		threshold = 1
-	}
-	if remaining > threshold {
-		return 0
-	}
-	windowLeft := reset.Sub(now)
-	if windowLeft <= 0 {
-		return 0
-	}
-	ratio := float64(threshold-remaining+1) / float64(threshold+1)
-	wait := time.Duration(ratio * float64(windowLeft) * 0.1)
-	if wait < time.Millisecond {
-		wait = time.Millisecond
-	}
-	low := wait / 2
-	if low < time.Millisecond {
-		low = time.Millisecond
-	}
-	high := wait + low
-	if high <= low {
-		high = low + time.Millisecond
-	}
-	return util.JitterDuration(low, high)
 }
 
 // global simple token bucket style based on RPS
