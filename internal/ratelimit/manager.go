@@ -303,9 +303,9 @@ type routeLimiter struct {
 
 func newRouteLimiter(route string) *routeLimiter {
 	rl := &routeLimiter{}
-	if cap, windowSec, ok := Heuristic(route); ok {
-		rl.cap = cap
-		rl.remaining = cap
+	if capacity, windowSec, ok := Heuristic(route); ok {
+		rl.cap = capacity
+		rl.remaining = capacity
 		rl.window = dur(windowSec)
 	}
 	return rl
