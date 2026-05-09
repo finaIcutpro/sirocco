@@ -9,6 +9,7 @@ func normalize(doc *openapi3.T) {
 	if doc.Info != nil {
 		doc.Info.Extensions = map[string]any{}
 	}
+	doc.Servers = proxyServers(doc.Servers)
 
 	if doc.Components == nil || doc.Components.Schemas == nil {
 		return
@@ -22,6 +23,28 @@ func normalize(doc *openapi3.T) {
 			normalizePath(path, seen)
 		}
 	}
+}
+
+func proxyServers(existing openapi3.Servers) openapi3.Servers {
+	out := openapi3.Servers{
+		&openapi3.Server{URL: "/"},
+		&openapi3.Server{URL: "/api/v10"},
+	}
+	seen := map[string]struct{}{
+		"/":        {},
+		"/api/v10": {},
+	}
+	for _, server := range existing {
+		if server == nil {
+			continue
+		}
+		if _, ok := seen[server.URL]; ok {
+			continue
+		}
+		seen[server.URL] = struct{}{}
+		out = append(out, server)
+	}
+	return out
 }
 
 func normalizePath(path *openapi3.PathItem, seen map[*openapi3.Schema]struct{}) {

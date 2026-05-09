@@ -95,7 +95,9 @@ func (v *Validator) Validate(ctx context.Context, r *http.Request, body []byte) 
 
 	if err := v.validate(ctx, req); err != nil {
 		if stripped := stripDiscordAPIPrefix(req); stripped != nil {
-			if retryErr := v.validate(ctx, stripped); retryErr == nil {
+			if retryErr := v.validate(ctx, stripped); retryErr != nil {
+				return v.fromError(retryErr, r.Method, r.URL.Path)
+			} else {
 				return nil
 			}
 		}
