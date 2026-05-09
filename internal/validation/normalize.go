@@ -19,8 +19,23 @@ func normalize(doc *openapi3.T) {
 		normalizeSchema(schemaRef, seen)
 	}
 	if doc.Paths != nil {
+		allowEmptyAuditLogActionType(doc.Paths.Find("/guilds/{guild_id}/audit-logs"))
 		for _, path := range doc.Paths.Map() {
 			normalizePath(path, seen)
+		}
+	}
+}
+
+func allowEmptyAuditLogActionType(path *openapi3.PathItem) {
+	if path == nil || path.Get == nil {
+		return
+	}
+	for _, param := range path.Get.Parameters {
+		if param == nil || param.Value == nil {
+			continue
+		}
+		if param.Value.In == openapi3.ParameterInQuery && param.Value.Name == "action_type" {
+			param.Value.AllowEmptyValue = true
 		}
 	}
 }

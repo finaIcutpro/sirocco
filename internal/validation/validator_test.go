@@ -27,6 +27,19 @@ func TestValidatorAcceptsDiscordAPIPrefix(t *testing.T) {
 	}
 }
 
+func TestValidatorAllowsEmptyAuditLogActionType(t *testing.T) {
+	v, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v10/guilds/1214891881972895744/audit-logs?action_type=", nil)
+	req.Header.Set("Authorization", "Bot test-token")
+	if got := v.Validate(context.Background(), req, nil); got != nil {
+		t.Fatalf("Validate() = %#v, want nil", got)
+	}
+}
+
 func TestValidatorReportsStrippedRouteError(t *testing.T) {
 	v, err := New(nil)
 	if err != nil {
