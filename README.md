@@ -1,71 +1,83 @@
-# sirocco [![CodeFactor](https://www.codefactor.io/repository/github/noahcxrest/sirocco/badge)](https://www.codefactor.io/repository/github/noahcxrest/sirocco)
+# sirocco
 
-a single go binary that keeps discord rest buckets warm, retries the flaky edge for you, and surfaces the wait math right in the response so your bot can just send traffic. cuts ratelimits down by over 90%.
+sirocco is a small discord rest proxy that does the annoying rate limit work before discord has to yell at you. run one binary, point your bot at it, and it keeps route buckets warm, retries the flaky edge cases that are safe to retry, validates requests against discord's openapi spec, and tells you what happened with plain `X-Sirocco-*` headers.
 
-## zero-config wins (always on)
+that's basically the whole pitch. no dashboard, no database, no sidecar, no cluster dance, no generated client maze. it is just the proxy and the stuff the proxy actually needs.
 
-- **warm restarts without 429s** – bucket discoveries are persisted to disk and reloaded on boot, so new shards inherit the same buckets immediately.
-- **adaptive upstream resilience** – idempotent requests are retried with jittered backoff, tuned connection pools, and `x-ratelimit-precision` out of the box.
-- **actionable telemetry** – every response carries `x-sirocco-*` headers for planned wait, actual sleep, retries, and upstream latency; structured logs echo the same fields.
-- **one port ops** – built-in `/_sirocco/health` and `/_sirocco/meta` endpoints expose readiness plus live limiter stats—no extra admin container or sidecar.
+## what it does
+
+- plans discord rest buckets before traffic goes upstream.
+- learns real discord rate-limit headers and saves useful route state for warm restarts.
+- keeps a per-token global limiter, with optional per-token overrides when you need them.
+- retries idempotent requests on transient network errors, 5xx responses, and discord edge timeouts.
+- blocks bad requests early when openapi validation is enabled.
+- adds `X-Sirocco-*` response headers for route, wait time, retry count, status, and upstream latency.
+- exposes `/_sirocco/health` and `/_sirocco/meta` so ops checks do not need a whole extra thing.
 
 ## quick start
 
-1. grab the binary or run `go build ./cmd/sirocco`.
-2. set the only required dial target:
+```sh
+go build -o bin/sirocco ./cmd/sirocco
+SIROCCO_LISTEN=:8080 ./bin/sirocco
+```
 
-   ```bash
-   export PORT=8080
-   export DISCORD_BASE_URL=https://discord.com
-   ```
+point your bot http client at `http://host:8080/api/v10`. sirocco rewrites proxied requests to `SIROCCO_DISCORD_BASE_URL`, which defaults to `https://discord.com`.
 
-3. start the proxy: `./sirocco` (or run the docker image found in this repo).
-4. point your bot http client at `http://host:8080/api`—the proxy handles retries, waits, and logging from here.
+## config
 
-## out-of-the-box automation
+| variable | default | description |
+| --- | --- | --- |
+| `SIROCCO_LISTEN` | `0.0.0.0:8080` via `BIND_IP`/`PORT` compatibility | http listen address |
+| `SIROCCO_DISCORD_BASE_URL` | `https://discord.com` | discord upstream base url |
+| `SIROCCO_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
+| `SIROCCO_VALIDATION_ENABLED` | `true` | validate requests against the embedded discord openapi spec |
+| `SIROCCO_STATE_PATH` | os cache dir + `sirocco/routes.json` | learned route-state file |
+| `SIROCCO_STATE_MAX_AGE` | `24h` | ignore persisted state older than this |
+| `SIROCCO_STATE_FLUSH_EVERY` | `30s` | periodic state save interval |
+| `SIROCCO_MAX_BODY_BYTES` | `33554432` | max buffered request body size |
+| `SIROCCO_GLOBAL_RPS` | `45` | default per-token global request rate |
+| `SIROCCO_TOKEN_RATES` | unset | `token:rps,token:rps` overrides |
+| `SIROCCO_REQUEST_TIMEOUT` | `5s` | upstream request timeout; millisecond numbers are also accepted |
+| `SIROCCO_DIAL_TIMEOUT` | `2.5s` | tcp/tls dial timeout |
+| `SIROCCO_IDLE_CONN_TIMEOUT` | `90s` | upstream idle connection timeout |
+| `SIROCCO_DISABLE_HTTP2` | `false` | disable http/2 to discord |
+| `SIROCCO_OUTBOUND_IP` | unset | optional local egress ip |
+| `SIROCCO_UPSTREAM_RETRY_LIMIT` | `3` | retry attempts for idempotent requests |
+| `SIROCCO_UPSTREAM_RETRY_BASE_DELAY` | `200ms` | retry backoff floor |
+| `SIROCCO_UPSTREAM_RETRY_MAX_DELAY` | `2s` | retry backoff ceiling |
 
-- persistent route cache backed by your os cache folder (`SIROCCO_STATE_PATH` overrides it when you want).
-- large, pre-tuned http pool (tls12+, 512 idle slots, per-host caps) with optional outbound ip pinning.
-- invalid-request guard that throttles before cloudflare does, now visible through the meta endpoint.
-- smart rate-limit heuristics with fifo bucket queues so bursts stay smooth even at large scale.
-- blocks malformed requests using Discord's OpenAPI spec before they reach upstream, preventing 400/401/403 storms and reducing unnecessary load. (requires VALIDATION_ENABLED env var)
+the old `PORT`, `BIND_IP`, `DISCORD_BASE_URL`, `VALIDATION_ENABLED`, `REQUEST_TIMEOUT`, `DIAL_TIMEOUT`, `IDLE_CONN_TIMEOUT`, `DISABLE_HTTP_2`, `OUTBOUND_IP`, `UPSTREAM_RETRY_LIMIT`, `UPSTREAM_RETRY_BASE_DELAY`, `UPSTREAM_RETRY_MAX_DELAY`, `RATELIMIT_OVERRIDES`, and `LOG_LEVEL` names still work too.
 
-## Performance
+## endpoints
 
-- **low resource usage** – runs on less than 30 MB of RAM and uses only 5% CPU while handling 300 requests per second. sirocco can easily run on hetzners cheapest VPS.
-- **effective rate limit reduction** – cuts down rate limits by over 90%, and most of the time above 95%. 
+- `get /_sirocco/health` returns `200 ok` when the listener is up.
+- `get /_sirocco/meta` returns uptime, limiter counters, validation counters, retry config, and state persistence status.
+- every other path is proxied to discord.
 
-## why not roll your own gateway?
+## why not just use nirn-proxy
 
-- you'd have to implement route normalization, warm-start, guard rails for 401/403 storms, multiple retries, jitter, and connection management yourself.
-- sirocco already streams exact wait times back to the caller and ships json diagnostics, so your application code stays focused on discord logic.
+[nirn-proxy](https://github.com/germanoeich/nirn-proxy) is a serious project, and if you want the gossip/cluster style setup then yeah, go look at it. sirocco is for the more boring case where you want one thing to run, one port to point at, and fewer knobs to babysit at 2am.
 
-## why sirocco over [nirn proxy](https://github.com/germanoeich/nirn-proxy)?
+the main difference is that sirocco keeps the common path stupidly simple: it has warm bucket state on disk, conservative route planning, idempotent retry logic, request validation, and useful response headers without needing a dashboard or a separate metrics story to understand what happened. that makes it easier to drop in front of a bot fleet, especially when you care more about not hitting 429s than about building a whole proxy control plane.
 
-- no gossip or cluster bootstrap—drop one binary and get persistent buckets + health endpoints instantly.
-- auto-heated buckets via disk snapshots, so fresh deployments don't take the 429 tax.
-- built-in invalid request dampener and retry policy instead of wiring prometheus + custom backoff rules.
-- fewer moving parts: no extra listeners, fewer knobs, same structured output nirn expects you to assemble.
+so the short version is: nirn-proxy is bigger and more distributed. sirocco is smaller, calmer, and honestly easier to trust when you just need discord rest traffic to stop wasting your time.
 
-## operations cheat sheet
+## openapi spec
 
-- **health:** `get /_sirocco/health` → `200 ok` if the listener is up.
-- **meta:** `get /_sirocco/meta` → json with uptime, bucket/global counts, retry settings, and state path.
-- **response headers:** every proxied request includes `x-sirocco-waited`, `x-sirocco-planned-wait`, `x-sirocco-upstream-status`, and retry counts.
-- **validation stats:** meta endpoint includes validation metrics when enabled (`validation_enabled`, `validation_requests`, `validation_blocked`, `validation_block_rate`, `validation_top_reasons`).
-- **blocked requests:** invalid requests return `400 Bad Request` with `x-sirocco-validation: blocked` header and JSON error details.
-- **env overrides:**
+the embedded spec comes from discord's official public preview repository:
 
-  | variable | default | notes |
-  | --- | --- | --- |
-  | `PORT` | `8080` | listener port |
-  | `DISCORD_BASE_URL` | `https://discord.com` | upstream base |
-  | `SIROCCO_STATE_PATH` | os cache dir + `route-state.json` | change where bucket state is persisted |
-  | `UPSTREAM_RETRY_LIMIT` | `3` | idempotent retry attempts |
-  | `UPSTREAM_RETRY_BASE_DELAY` | `200` ms | jittered exponential backoff floor |
-  | `UPSTREAM_RETRY_MAX_DELAY` | `2000` ms | backoff ceiling |
-  | `BOT_RATELIMIT_OVERRIDES` | unset | `token:rps` pairs for global overrides |
-  | `VALIDATION_ENABLED` | `true` | enable/disable request validation against Discord OpenAPI spec |
-  | `LOG_LEVEL` | `info` | zerolog level |
+```sh
+make update-spec
+```
 
-that's it—ship the binary, aim your shards at it, and let sirocco keep your discord rest traffic fast, safe, and hands-off.
+that command downloads `https://raw.githubusercontent.com/discord/discord-api-spec/main/specs/openapi.json`, validates json, and runs validation tests. discord marks the spec as public preview, so runtime uses the last committed known-good spec until updates pass tests.
+
+## production build
+
+```sh
+make test
+make build
+docker build -t sirocco:local .
+```
+
+the docker image is a static binary on a non-root distroless runtime with ca certificates.

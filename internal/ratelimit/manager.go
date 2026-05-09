@@ -1,142 +1,162 @@
 package ratelimit
 
 import (
-	"crypto/sha1"
-	"encoding/hex"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/rs/zerolog"
-
-	"github.com/melonly/sirocco/internal/config"
-	"github.com/melonly/sirocco/internal/util"
 )
 
-// Manager coordinates global and route-scoped rate limits.
+type Config struct {
+	GlobalRPS  int
+	TokenRates map[string]int
+}
+
 type Manager struct {
-	cfg *config.Config
-	log zerolog.Logger
+	cfg Config
+	log *slog.Logger
 
 	mu      sync.RWMutex
-	buckets map[string]*routeLimiter
-	globals map[string]*globalLimiter
+	routes  map[string]*routeBucket
+	globals map[string]*globalBucket
 
-	avoided atomic.Uint64
-	hits    atomic.Uint64
-	total   atomic.Uint64
-	invalid atomic.Uint64
+	requests atomic.Uint64
+	waits    atomic.Uint64
+	hits     atomic.Uint64
+	invalid  atomic.Uint64
+	dirty    atomic.Bool
+
+	stateMu sync.RWMutex
+	state   StateStatus
 }
 
-const (
-	maxRetryAfter = 2 * time.Second
-)
+type Plan struct {
+	Key      string
+	Route    string
+	TokenKey string
+}
 
-// Snapshot returns a summary of limiter state for diagnostics.
 type Snapshot struct {
-	Buckets           int    `json:"buckets"`
-	Globals           int    `json:"globals"`
-	InvalidEvents     int    `json:"invalid_events"`
-	RateLimitsAvoided uint64 `json:"rate_limits_avoided"`
-	RateLimitsHit     uint64 `json:"rate_limits_hit"`
-	TotalRequests     uint64 `json:"total_requests"`
+	Buckets           int         `json:"buckets"`
+	Globals           int         `json:"globals"`
+	InvalidEvents     uint64      `json:"invalid_events"`
+	RateLimitsAvoided uint64      `json:"rate_limits_avoided"`
+	RateLimitsHit     uint64      `json:"rate_limits_hit"`
+	TotalRequests     uint64      `json:"total_requests"`
+	State             StateStatus `json:"state"`
 }
 
-func NewManager(cfg *config.Config, log zerolog.Logger) *Manager {
-	return &Manager{
-		cfg:     cfg,
-		log:     log,
-		buckets: make(map[string]*routeLimiter),
-		globals: make(map[string]*globalLimiter),
+type ReleaseMeta struct {
+	Headers map[string]string
+	Status  int
+}
+
+func New(cfg Config, log *slog.Logger) *Manager {
+	if cfg.GlobalRPS <= 0 {
+		cfg.GlobalRPS = 45
 	}
-}
-
-// Plan returns the bucket key and normalized route pattern used for limiter coordination.
-func (m *Manager) Plan(method, path, token string) (bucketKey, route string) {
-	route = NormalizeRoute(method, path)
-	if token == "" {
-		return "r::" + route, route
+	if log == nil {
+		log = slog.Default()
 	}
-	tokenKey := tokenRouteKey(token)
-	return "r:" + tokenKey + ":" + route, route
+	return &Manager{cfg: cfg, log: log, routes: make(map[string]*routeBucket), globals: make(map[string]*globalBucket)}
 }
 
-// AcquireWithRoute returns a release function and the amount of time the caller should wait
-// before making the upstream request.
-func (m *Manager) AcquireWithRoute(key, token, route string, want time.Time) (func(success bool, headers map[string]string), time.Duration) {
-	m.total.Add(1)
+func (m *Manager) Plan(method, path, token string) Plan {
+	route := Normalize(method, path)
+	tokenKey := TokenKey(token)
+	return Plan{Key: "r:" + tokenKey + ":" + route, Route: route, TokenKey: tokenKey}
+}
 
-	rl := m.getRouteLimiter(key, route)
-	gl := m.getGlobalLimiter(token)
+func (m *Manager) Acquire(plan Plan, token string, now time.Time) (time.Duration, func(bool, ReleaseMeta)) {
+	m.requests.Add(1)
 
-	wait := rl.reserve(want)
-	if gl != nil {
-		if gw := gl.reserve(want); gw > wait {
+	route := m.route(plan.Key, plan.Route)
+	global := m.global(token)
+
+	wait := route.reserve(now)
+	if global != nil {
+		if gw := global.reserve(now); gw > wait {
 			wait = gw
 		}
 	}
 	if wait > 0 {
-		m.avoided.Add(1)
-		m.log.Debug().Dur("wait", wait).Str("key", key).Str("token", util.MaskToken(token)).Str("route", route).Msg("rate limiting request")
+		m.waits.Add(1)
 	}
 
-	release := func(success bool, headers map[string]string) {
-		meta := parseReleaseMeta(headers)
-		if meta.hasRetryAfter || meta.status == 429 {
+	release := func(success bool, meta ReleaseMeta) {
+		parsed := parse(meta)
+		if parsed.hasRetryAfter || parsed.status == 429 {
 			m.hits.Add(1)
 		}
-		if meta.isGlobal && gl != nil {
-			gl.applyRetry(meta)
-		} else {
-			rl.apply(meta)
+		if parsed.global && global != nil {
+			global.applyRetry(parsed)
+		} else if route.apply(parsed) {
+			m.dirty.Store(true)
 		}
-		m.trackInvalid(route, meta)
+		m.trackInvalid(plan.Route, parsed)
 	}
 
-	return release, wait
+	return wait, release
 }
 
-func (m *Manager) getRouteLimiter(key, route string) *routeLimiter {
+func (m *Manager) Snapshot() Snapshot {
 	m.mu.RLock()
-	rl := m.buckets[key]
+	buckets := len(m.routes)
+	globals := len(m.globals)
 	m.mu.RUnlock()
-	if rl != nil {
-		return rl
+
+	m.stateMu.RLock()
+	state := m.state
+	m.stateMu.RUnlock()
+
+	return Snapshot{Buckets: buckets, Globals: globals, InvalidEvents: m.invalid.Load(), RateLimitsAvoided: m.waits.Load(), RateLimitsHit: m.hits.Load(), TotalRequests: m.requests.Load(), State: state}
+}
+
+func (m *Manager) Dirty() bool { return m.dirty.Load() }
+
+func (m *Manager) route(key, route string) *routeBucket {
+	m.mu.RLock()
+	b := m.routes[key]
+	m.mu.RUnlock()
+	if b != nil {
+		return b
 	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if rl = m.buckets[key]; rl != nil {
-		return rl
+	if b = m.routes[key]; b != nil {
+		return b
 	}
-	rl = newRouteLimiter(route)
-	m.buckets[key] = rl
-	return rl
+	b = newRouteBucket(route)
+	m.routes[key] = b
+	return b
 }
 
-func (m *Manager) getGlobalLimiter(token string) *globalLimiter {
+func (m *Manager) global(token string) *globalBucket {
 	if token == "" {
 		return nil
 	}
 	m.mu.RLock()
-	gl := m.globals[token]
+	b := m.globals[token]
 	m.mu.RUnlock()
-	if gl != nil {
-		return gl
+	if b != nil {
+		return b
 	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if gl = m.globals[token]; gl != nil {
-		return gl
+	if b = m.globals[token]; b != nil {
+		return b
 	}
-	base := 45
-	if o, ok := m.cfg.GlobalOverride[token]; ok && o > 0 {
-		base = o
+	rate := m.cfg.GlobalRPS
+	if override := m.cfg.TokenRates[token]; override > 0 {
+		rate = override
 	}
-	gl = &globalLimiter{rate: base}
-	m.globals[token] = gl
-	return gl
+	b = &globalBucket{rate: rate}
+	m.globals[token] = b
+	return b
 }
 
 func (m *Manager) trackInvalid(route string, meta releaseMeta) {
@@ -149,21 +169,6 @@ func (m *Manager) trackInvalid(route string, meta releaseMeta) {
 	}
 }
 
-// Snapshot returns a summary of limiter state for diagnostics.
-func (m *Manager) Snapshot() Snapshot {
-	snap := Snapshot{}
-	m.mu.RLock()
-	snap.Buckets = len(m.buckets)
-	snap.Globals = len(m.globals)
-	m.mu.RUnlock()
-	snap.InvalidEvents = int(m.invalid.Load())
-	snap.RateLimitsAvoided = m.avoided.Load()
-	snap.RateLimitsHit = m.hits.Load()
-	snap.TotalRequests = m.total.Load()
-	return snap
-}
-
-// releaseMeta captures the signal headers returned by Discord.
 type releaseMeta struct {
 	scope         string
 	bucketID      string
@@ -172,253 +177,62 @@ type releaseMeta struct {
 	resetAfter    float64
 	retryAfter    float64
 	status        int
-	isGlobal      bool
+	global        bool
 	hasLimit      bool
 	hasRemaining  bool
 	hasResetAfter bool
 	hasRetryAfter bool
 }
 
-func parseReleaseMeta(headers map[string]string) releaseMeta {
+func parse(meta ReleaseMeta) releaseMeta {
+	headers := meta.Headers
 	if headers == nil {
-		return releaseMeta{}
+		headers = map[string]string{}
 	}
 	scope := strings.ToLower(headers["x-ratelimit-scope"])
-	globalHint := strings.ToLower(headers["x-ratelimit-global"]) == "true"
-
-	meta := releaseMeta{
-		scope:    scope,
-		bucketID: headers["x-ratelimit-bucket"],
-		status:   parseInt(headers["x-sirocco-status"]),
-		isGlobal: scope == "global" || globalHint,
+	parsed := releaseMeta{scope: scope, bucketID: headers["x-ratelimit-bucket"], status: meta.Status, global: scope == "global" || strings.EqualFold(headers["x-ratelimit-global"], "true")}
+	if parsed.status == 0 {
+		parsed.status = atoi(headers["x-sirocco-status"])
 	}
-
-	if limit, ok := parseIntOK(headers["x-ratelimit-limit"]); ok {
-		meta.limit = limit
-		meta.hasLimit = true
-	}
-	if remaining, ok := parseIntOK(headers["x-ratelimit-remaining"]); ok {
-		meta.remaining = remaining
-		meta.hasRemaining = true
-	}
-	if resetAfter, ok := parseFloatOK(headers["x-ratelimit-reset-after"]); ok {
-		meta.resetAfter = resetAfter
-		meta.hasResetAfter = true
-	}
-	if retryAfter, ok := parseFloatOK(headers["retry-after"]); ok {
-		meta.retryAfter = retryAfter
-		meta.hasRetryAfter = true
-	}
-
-	return meta
+	parsed.limit, parsed.hasLimit = atoiOK(headers["x-ratelimit-limit"])
+	parsed.remaining, parsed.hasRemaining = atoiOK(headers["x-ratelimit-remaining"])
+	parsed.resetAfter, parsed.hasResetAfter = atofOK(headers["x-ratelimit-reset-after"])
+	parsed.retryAfter, parsed.hasRetryAfter = atofOK(headers["retry-after"])
+	return parsed
 }
 
-// NormalizeRoute returns Discord-style route pattern preserving major parameters.
-func NormalizeRoute(method, path string) string {
-	parts := strings.Split(path, "/")
-	preserveNext := false
-	for i := 1; i < len(parts); i++ {
-		p := parts[i]
-		low := strings.ToLower(p)
-		switch low {
-		case "channels", "guilds", "webhooks":
-			preserveNext = true
-		default:
-			if preserveNext {
-				preserveNext = false
-			} else if isSnowflake(p) {
-				parts[i] = ":id"
-			}
-		}
-	}
-	return method + " " + strings.Join(parts, "/")
+func atoi(s string) int {
+	v, _ := strconv.Atoi(s)
+	return v
 }
 
-func isSnowflake(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return len(s) >= 5
-}
-
-func tokenRouteKey(token string) string {
-	sum := sha1.Sum([]byte(token))
-	return hex.EncodeToString(sum[:])
-}
-
-// Helpers
-func parseInt(s string) int { n, _ := strconv.Atoi(s); return n }
-
-func parseIntOK(s string) (int, bool) {
+func atoiOK(s string) (int, bool) {
 	if s == "" {
 		return 0, false
 	}
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, false
-	}
-	return n, true
+	v, err := strconv.Atoi(s)
+	return v, err == nil
 }
 
-func parseFloatOK(s string) (float64, bool) {
+func atofOK(s string) (float64, bool) {
 	if s == "" {
 		return 0, false
 	}
-	f, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0, false
-	}
-	return f, true
+	v, err := strconv.ParseFloat(s, 64)
+	return v, err == nil
 }
 
-func dur(sec float64) time.Duration {
-	return time.Duration(sec * float64(time.Second))
+func durationSeconds(seconds float64) time.Duration {
+	return time.Duration(seconds * float64(time.Second))
 }
 
-func clampRetryAfterDuration(sec float64) time.Duration {
-	if sec <= 0 {
+func retryAfter(seconds float64) time.Duration {
+	if seconds <= 0 {
 		return 0
 	}
-	wait := dur(sec)
-	if wait > maxRetryAfter {
-		return maxRetryAfter
+	d := durationSeconds(seconds)
+	if d > 15*time.Minute {
+		return 15 * time.Minute
 	}
-	return wait
-}
-
-// routeLimiter enforces per-route limits based on heuristics and header feedback.
-type routeLimiter struct {
-	mu         sync.Mutex
-	cap        int
-	remaining  int
-	window     time.Duration
-	reset      time.Time
-	blockUntil time.Time
-}
-
-func newRouteLimiter(route string) *routeLimiter {
-	rl := &routeLimiter{}
-	if capacity, windowSec, ok := Heuristic(route); ok {
-		rl.cap = capacity
-		rl.remaining = capacity
-		rl.window = dur(windowSec)
-	}
-	return rl
-}
-
-func (rl *routeLimiter) reserve(now time.Time) time.Duration {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	if now.Before(rl.blockUntil) {
-		return rl.blockUntil.Sub(now)
-	}
-	if rl.window > 0 && (rl.reset.IsZero() || now.After(rl.reset)) {
-		rl.reset = now.Add(rl.window)
-		rl.remaining = rl.cap
-	}
-	if rl.cap == 0 {
-		return 0
-	}
-	if rl.remaining > 0 {
-		rl.remaining--
-		return 0
-	}
-	wait := rl.reset.Sub(now)
-	if wait < 0 {
-		wait = 0
-	}
-	return wait
-}
-
-func (rl *routeLimiter) apply(meta releaseMeta) {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	now := time.Now()
-	if meta.hasRetryAfter && meta.retryAfter > 0 {
-		wait := clampRetryAfterDuration(meta.retryAfter)
-		until := now.Add(wait)
-		if until.After(rl.blockUntil) {
-			rl.blockUntil = until
-		}
-	}
-	if meta.hasLimit && meta.limit > 0 {
-		rl.cap = meta.limit
-		if !meta.hasRemaining {
-			rl.remaining = meta.limit
-		}
-	}
-	if meta.hasRemaining {
-		rl.remaining = meta.remaining
-		if rl.remaining < 0 {
-			rl.remaining = 0
-		}
-	}
-	if meta.hasResetAfter && meta.resetAfter > 0 {
-		rl.window = dur(meta.resetAfter)
-		rl.reset = now.Add(rl.window)
-	} else if rl.window == 0 && rl.cap > 0 {
-		rl.window = time.Second
-		rl.reset = now.Add(rl.window)
-	}
-	if rl.cap > 0 && rl.remaining > rl.cap {
-		rl.remaining = rl.cap
-	}
-}
-
-// globalLimiter enforces per-token global limits.
-type globalLimiter struct {
-	mu         sync.Mutex
-	rate       int
-	used       int
-	reset      time.Time
-	blockUntil time.Time
-}
-
-func (gl *globalLimiter) reserve(now time.Time) time.Duration {
-	gl.mu.Lock()
-	defer gl.mu.Unlock()
-
-	if now.Before(gl.blockUntil) {
-		return gl.blockUntil.Sub(now)
-	}
-	if now.After(gl.reset) {
-		gl.reset = now.Add(time.Second)
-		gl.used = 0
-	}
-	if gl.rate <= 0 {
-		return 0
-	}
-	if gl.used < gl.rate {
-		gl.used++
-		return 0
-	}
-	wait := gl.reset.Sub(now)
-	if wait < 0 {
-		wait = 0
-	}
-	return wait
-}
-
-func (gl *globalLimiter) applyRetry(meta releaseMeta) {
-	if !meta.hasRetryAfter || meta.retryAfter <= 0 {
-		return
-	}
-	gl.mu.Lock()
-	defer gl.mu.Unlock()
-
-	wait := clampRetryAfterDuration(meta.retryAfter)
-	until := time.Now().Add(wait)
-	if until.After(gl.blockUntil) {
-		gl.blockUntil = until
-	}
-	if gl.rate > 1 {
-		gl.rate--
-	}
+	return d
 }
