@@ -104,7 +104,10 @@ func normalizeSchema(ref *openapi3.SchemaRef, seen map[*openapi3.Schema]struct{}
 	}
 	seen[schema] = struct{}{}
 
-	delete(schema.Extensions, "const")
+	if constant, ok := schema.Extensions["const"]; ok {
+		schema.Enum = []any{constant}
+		delete(schema.Extensions, "const")
+	}
 	delete(schema.Extensions, "contentEncoding")
 	delete(schema.Extensions, "contentMediaType")
 	delete(schema.Extensions, "x-discord-union")
@@ -118,6 +121,7 @@ func normalizeSchema(ref *openapi3.SchemaRef, seen map[*openapi3.Schema]struct{}
 		}
 		if len(types) == 0 {
 			schema.Type = nil
+			schema.Enum = []any{nil}
 		} else {
 			normalized := openapi3.Types(types)
 			schema.Type = &normalized
