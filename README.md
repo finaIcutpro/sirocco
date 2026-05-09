@@ -48,6 +48,8 @@ point your bot http client at `http://host:8080/api/v10`. sirocco rewrites proxi
 
 the old `PORT`, `BIND_IP`, `DISCORD_BASE_URL`, `VALIDATION_ENABLED`, `REQUEST_TIMEOUT`, `DIAL_TIMEOUT`, `IDLE_CONN_TIMEOUT`, `DISABLE_HTTP_2`, `OUTBOUND_IP`, `UPSTREAM_RETRY_LIMIT`, `UPSTREAM_RETRY_BASE_DELAY`, `UPSTREAM_RETRY_MAX_DELAY`, `RATELIMIT_OVERRIDES`, and `LOG_LEVEL` names still work too.
 
+in docker, use `SIROCCO_STATE_PATH=/var/lib/sirocco/routes.json`. the image creates that directory for the non-root user, so route state can actually persist instead of failing on permissions.
+
 ## endpoints
 
 - `get /_sirocco/health` returns `200 ok` when the listener is up.
