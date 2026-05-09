@@ -1,4 +1,4 @@
-FROM cgr.dev/chainguard/go:1.26 AS build
+FROM cgr.dev/chainguard/go:latest AS build
 
 WORKDIR /src
 
