@@ -16,6 +16,8 @@ import (
 
 type fakeUpstream struct{}
 
+func (fakeUpstream) Stats() discord.Stats { return discord.Stats{} }
+
 func (fakeUpstream) Do(ctx context.Context, r *http.Request, body []byte) (*http.Response, discord.Meta, error) {
 	resp := &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("proxied"))}
 	resp.Header.Set("Content-Type", "text/plain")
@@ -42,5 +44,20 @@ func TestHealthAndProxy(t *testing.T) {
 	}
 	if proxy.Header().Get("X-Sirocco-Route") == "" || proxy.Header().Get("X-Sirocco-Upstream-Status") != "201" {
 		t.Fatalf("missing sirocco headers: %#v", proxy.Header())
+	}
+}
+
+func TestMetaIncludesUpstreamStats(t *testing.T) {
+	cfg := config.Config{ListenAddress: "127.0.0.1:0", DiscordBaseURL: "https://discord.com", MaxBodyBytes: 1024, HTTP: config.HTTPConfig{RetryLimit: 1, RetryBaseDelay: time.Millisecond, RetryMaxDelay: time.Millisecond}, Rate: config.RateConfig{GlobalRPS: 45}}
+	limiter := ratelimit.New(ratelimit.Config{GlobalRPS: 45}, nil)
+	server := New(cfg, nil, limiter, fakeUpstream{}, nil)
+
+	meta := httptest.NewRecorder()
+	server.ServeHTTP(meta, httptest.NewRequest(http.MethodGet, "/_sirocco/meta", nil))
+	if meta.Code != http.StatusOK {
+		t.Fatalf("meta code=%d body=%q", meta.Code, meta.Body.String())
+	}
+	if !strings.Contains(meta.Body.String(), `"upstream"`) || !strings.Contains(meta.Body.String(), `"total_requests"`) {
+		t.Fatalf("meta body missing upstream stats: %s", meta.Body.String())
 	}
 }

@@ -19,6 +19,7 @@ import (
 
 type Upstream interface {
 	Do(context.Context, *http.Request, []byte) (*http.Response, discord.Meta, error)
+	Stats() discord.Stats
 }
 
 type Validator interface {
@@ -98,6 +99,7 @@ func (s *Server) meta(w http.ResponseWriter, r *http.Request) {
 		DiscordBaseURL     string            `json:"discord_base_url"`
 		ValidationEnabled  bool              `json:"validation_enabled"`
 		Validation         *validation.Stats `json:"validation,omitempty"`
+		Upstream           discord.Stats     `json:"upstream"`
 		Limiter            any               `json:"limiter"`
 		MaxUpstreamRetries int               `json:"max_upstream_retries"`
 		RetryBaseMillis    int64             `json:"retry_base_ms"`
@@ -111,6 +113,7 @@ func (s *Server) meta(w http.ResponseWriter, r *http.Request) {
 		ListenAddress:      s.cfg.ListenAddress,
 		DiscordBaseURL:     s.cfg.DiscordBaseURL,
 		ValidationEnabled:  s.validator != nil,
+		Upstream:           s.upstream.Stats(),
 		Limiter:            snap,
 		MaxUpstreamRetries: s.cfg.HTTP.RetryLimit,
 		RetryBaseMillis:    s.cfg.HTTP.RetryBaseDelay.Milliseconds(),

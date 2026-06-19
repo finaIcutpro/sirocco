@@ -58,3 +58,31 @@ func TestClientDoesNotRetryPost(t *testing.T) {
 		t.Fatalf("hits = %d, want 1", hits.Load())
 	}
 }
+
+func TestClientStats(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(10 * time.Millisecond)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer ts.Close()
+
+	base, _ := url.Parse(ts.URL)
+	client := NewClientWithHTTP(base, ts.Client(), config.HTTPConfig{RetryLimit: 0, RetryBaseDelay: time.Millisecond, RetryMaxDelay: time.Millisecond}, nil)
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.test/api/v10/users/@me", nil)
+	resp, meta, err := client.Do(context.Background(), req, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	stats := client.Stats()
+	if stats.TotalRequests != 1 {
+		t.Fatalf("total_requests = %d, want 1", stats.TotalRequests)
+	}
+	if stats.TotalDurationSeconds <= 0 || stats.AvgDurationSeconds <= 0 || stats.MaxDurationSeconds <= 0 {
+		t.Fatalf("duration stats should be positive: %#v", stats)
+	}
+	if stats.MaxDurationSeconds < meta.Latency.Seconds() {
+		t.Fatalf("max_duration_seconds = %f, latency = %s", stats.MaxDurationSeconds, meta.Latency)
+	}
+}

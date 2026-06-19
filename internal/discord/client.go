@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/melonly/sirocco/internal/config"
@@ -25,6 +26,16 @@ type Client struct {
 	retryLimit int
 	retryBase  time.Duration
 	retryMax   time.Duration
+	requests   atomic.Uint64
+	durationNs atomic.Uint64
+	maxLatency atomic.Uint64
+}
+
+type Stats struct {
+	TotalRequests        uint64  `json:"total_requests"`
+	TotalDurationSeconds float64 `json:"total_duration_seconds"`
+	AvgDurationSeconds   float64 `json:"avg_duration_seconds"`
+	MaxDurationSeconds   float64 `json:"max_duration_seconds"`
 }
 
 type Meta struct {
@@ -90,6 +101,7 @@ func (c *Client) Do(ctx context.Context, in *http.Request, body []byte) (*http.R
 		started := time.Now()
 		resp, err := c.http.Do(req)
 		latency := time.Since(started)
+		c.recordLatency(latency)
 
 		if err != nil {
 			if !c.retryError(in.Method, err, attempt) {
@@ -113,6 +125,37 @@ func (c *Client) Do(ctx context.Context, in *http.Request, body []byte) (*http.R
 		}
 
 		return resp, meta, nil
+	}
+}
+
+func (c *Client) Stats() Stats {
+	requests := c.requests.Load()
+	totalNs := c.durationNs.Load()
+	maxNs := c.maxLatency.Load()
+	var avg float64
+	if requests > 0 {
+		avg = float64(totalNs) / float64(requests) / float64(time.Second)
+	}
+	return Stats{
+		TotalRequests:        requests,
+		TotalDurationSeconds: float64(totalNs) / float64(time.Second),
+		AvgDurationSeconds:   avg,
+		MaxDurationSeconds:   float64(maxNs) / float64(time.Second),
+	}
+}
+
+func (c *Client) recordLatency(d time.Duration) {
+	if d < 0 {
+		return
+	}
+	ns := uint64(d)
+	c.requests.Add(1)
+	c.durationNs.Add(ns)
+	for {
+		cur := c.maxLatency.Load()
+		if ns <= cur || c.maxLatency.CompareAndSwap(cur, ns) {
+			return
+		}
 	}
 }
 
